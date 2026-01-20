@@ -100,7 +100,7 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
         duration_ms=$(( (span_end - span_start) / 1000000 ))
         if insert_span "$PROJECT_ID" "$span" >/dev/null; then
             LLM_CALLS=$((LLM_CALLS + 1))
-            debug "LLM span: $model (${duration_ms}ms, in=$prompt out=$completion cache_create=$cache_create cache_read=$cache_read)"
+            debug "LLM span: $model (${duration_ms}ms)"
         fi
     }
 
