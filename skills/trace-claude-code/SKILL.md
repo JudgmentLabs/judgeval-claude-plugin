@@ -24,11 +24,11 @@ Session (task span)
 
 ## Setup
 
-Run the setup script:
+After installing the plugin, run setup in your project directory:
 
 ```bash
-cd skills/trace-claude-code
-./setup.sh
+cd /path/to/your/project
+bash ~/.claude/plugins/marketplaces/judgeval-claude-plugin/skills/trace-claude-code/setup.sh
 ```
 
 This will prompt you for:
