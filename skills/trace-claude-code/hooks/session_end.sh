@@ -77,6 +77,7 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     LINE_NUM=0
     CONVERSATION_HISTORY="[]"
     PENDING_TOOLS="{}"
+    TURN_INPUT=""
 
     create_llm_span() {
         local output="$1" model="$2" prompt="$3" completion="$4" history="$5"
@@ -207,6 +208,8 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
                         TXT=$(echo "$CONTENT" | jq -r 'if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null)
                     fi
                     [ -n "$TXT" ] && CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg c "$TXT" '. += [{role: "user", content: $c}]')
+                    # Capture first user message as turn input
+                    [ -z "$TURN_INPUT" ] && [ -n "$TXT" ] && TURN_INPUT="$TXT"
                 fi
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
                 CURRENT_OUTPUT=""; CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0
@@ -248,8 +251,9 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
 
     TURN_END=$(get_time_nanos)
     TURN_NUM=${TURN_COUNT:-1}
-    TURN_ATTRS=$(build_otlp_attributes "$(jq -n --arg span_kind "task" --arg output "${CURRENT_OUTPUT:-Completed}" --argjson turn "$TURN_NUM" --argjson llm "$LLM_CALLS" --argjson tools "$TOOL_CALLS" \
-        '{"judgment.span_kind": $span_kind, "judgment.output": $output, "turn_number": $turn, "llm_call_count": $llm, "tool_count": $tools}')")
+    TURN_INPUT_JSON=$(echo "${TURN_INPUT:-}" | jq -Rs '.')
+    TURN_ATTRS=$(build_otlp_attributes "$(jq -n --arg span_kind "task" --argjson input "$TURN_INPUT_JSON" --arg output "${CURRENT_OUTPUT:-Completed}" --argjson turn "$TURN_NUM" --argjson llm "$LLM_CALLS" --argjson tools "$TOOL_CALLS" \
+        '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "turn_number": $turn, "llm_call_count": $llm, "tool_count": $tools}')")
     TURN_SPAN=$(build_otlp_span "$TRACE_ID" "$TURN_SPAN_ID" "$ROOT_SPAN_ID" "Turn $TURN_NUM" "task" "$TURN_START" "$TURN_END" "$TURN_ATTRS" 20)
     insert_span "$PROJECT_ID" "$TURN_SPAN" >/dev/null || debug "Failed to finalize turn"
 
