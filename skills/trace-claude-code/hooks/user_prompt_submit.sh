@@ -73,8 +73,7 @@ set_session_state_batch "$SESSION_ID" \
     "turn_count" "$TURN_COUNT" \
     "current_turn_span_id" "$TURN_SPAN_ID" \
     "current_turn_start" "$START_TIME" \
-    "current_turn_tool_count" "0" \
-    "turn_last_line" "0"
+    "current_turn_tool_count" "0"
 
 log "INFO" "Turn $TURN_COUNT started: span=$TURN_SPAN_ID"
 exit 0
