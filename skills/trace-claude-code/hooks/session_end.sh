@@ -76,14 +76,27 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     PENDING_TOOLS="{}"
     TASK_INPUT=""
 
+    detect_provider() {
+        local model="$1"
+        case "$model" in
+            anthropic/*|claude-*) echo "anthropic" ;;
+            openai/*|gpt-*) echo "openai" ;;
+            google/*|gemini-*) echo "google" ;;
+            meta-llama/*|llama-*) echo "meta" ;;
+            */*) echo "openrouter" ;;
+            *) echo "anthropic" ;;
+        esac
+    }
+
     create_llm_span() {
         local output="$1" model="$2" prompt="$3" completion="$4" history="$5"
         local cache_create="${6:-0}" cache_read="${7:-0}" start_time="$8" end_time="$9"
         [ -z "$output" ] && return
-        local span_id span_start span_end input_json output_json attrs span duration_ms
+        local span_id span_start span_end input_json output_json attrs span duration_ms provider
         span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
         span_start="${start_time:-$(get_time_nanos)}"
         span_end="${end_time:-$(get_time_nanos)}"
+        provider=$(detect_provider "$model")
         input_json=$(echo "$history" | jq -c '.' | jq -Rs '.')
         output_json=$(jq -n --arg c "$output" '[{role: "assistant", content: $c}]' | jq -c '.' | jq -Rs '.')
         local usage_meta
@@ -92,14 +105,15 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
             '{input_tokens: $inp, output_tokens: $out, cache_creation_input_tokens: $cc, cache_read_input_tokens: $cr}' | jq -c '.')
         attrs=$(build_otlp_attributes "$(jq -n \
             --arg span_kind "llm" --argjson input "$input_json" --argjson output "$output_json" \
-            --arg model "${model:-claude}" --argjson prompt "$prompt" --argjson completion "$completion" \
+            --arg model "${model:-claude}" --arg provider "$provider" \
+            --argjson prompt "$prompt" --argjson completion "$completion" \
             --argjson cache_create "$cache_create" --argjson cache_read "$cache_read" \
             --arg usage_meta "$usage_meta" \
             '{
               "judgment.span_kind": $span_kind,
               "judgment.input": $input,
               "judgment.output": $output,
-              "judgment.llm.provider": "anthropic",
+              "judgment.llm.provider": $provider,
               "judgment.llm.model": $model,
               "judgment.usage.non_cached_input_tokens": $prompt,
               "judgment.usage.output_tokens": $completion,
