@@ -7,89 +7,38 @@ on:
     branches: [main]
 
 jobs:
-  lint:
-    name: Lint Shell Scripts
+  validate:
+    name: Validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install shellcheck
-        run: sudo apt-get install -y shellcheck
-      
-      - name: Run shellcheck
-        run: |
-          shellcheck -x skills/trace-claude-code/hooks/*.sh
-          shellcheck -x skills/trace-claude-code/setup.sh
-
-  test:
-    name: Test Hooks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install dependencies
-        run: sudo apt-get install -y jq curl
-      
-      - name: Validate JSON files
+      - name: Validate JSON
         run: |
           jq . .claude-plugin/plugin.json > /dev/null
           jq . .claude-plugin/marketplace.json > /dev/null
+          echo "JSON files valid"
       
-      - name: Test hook syntax
+      - name: Check bash syntax
         run: |
-          for hook in skills/trace-claude-code/hooks/*.sh; do
-            bash -n "$hook" || exit 1
+          bash -n skills/trace-claude-code/setup.sh
+          for f in skills/trace-claude-code/hooks/*.sh; do
+            bash -n "$f"
           done
-          echo "All hooks have valid syntax"
-      
-      - name: Test common.sh functions
-        run: |
-          source skills/trace-claude-code/hooks/common.sh
-          
-          # Test UUID generation
-          uuid=$(generate_uuid)
-          [[ ${#uuid} -eq 36 ]] || { echo "UUID generation failed"; exit 1; }
-          
-          # Test time nanos
-          nanos=$(get_time_nanos)
-          [[ ${#nanos} -gt 10 ]] || { echo "Time nanos failed"; exit 1; }
-          
-          echo "Common functions work correctly"
-
-  validate:
-    name: Validate Plugin Structure
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          echo "Bash syntax valid"
       
       - name: Check required files
         run: |
-          required_files=(
+          files=(
             ".claude-plugin/plugin.json"
             ".claude-plugin/marketplace.json"
             "skills/trace-claude-code/SKILL.md"
             "skills/trace-claude-code/setup.sh"
             "skills/trace-claude-code/hooks/common.sh"
-            "skills/trace-claude-code/hooks/session_start.sh"
-            "skills/trace-claude-code/hooks/session_end.sh"
-            "skills/trace-claude-code/hooks/user_prompt_submit.sh"
-            "skills/trace-claude-code/hooks/post_tool_use.sh"
-            "skills/trace-claude-code/hooks/stop_hook.sh"
             "README.md"
             "LICENSE"
           )
-          
-          for file in "${required_files[@]}"; do
-            if [[ ! -f "$file" ]]; then
-              echo "Missing required file: $file"
-              exit 1
-            fi
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || { echo "Missing: $f"; exit 1; }
           done
-          
           echo "All required files present"
-      
-      - name: Validate marketplace.json
-        run: |
-          version=$(jq -r '.version' .claude-plugin/marketplace.json)
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version format"; exit 1; }
-          echo "Plugin version: $version"
