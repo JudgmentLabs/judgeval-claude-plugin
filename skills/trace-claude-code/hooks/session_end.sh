@@ -133,27 +133,16 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     create_tool_span() {
         local tool_name="$1" tool_input="$2" tool_output="$3" start_time="$4" end_time="$5"
         [ -z "$tool_name" ] && return
-        local span_id span_name f c input_json output_json attrs span
+        local span_id input_json output_json attrs span
         span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
-        span_name="$tool_name"
-        case "$tool_name" in
-            Read|Write|Edit)
-                f=$(echo "$tool_input" | jq -r '.file_path // .path // empty' 2>/dev/null)
-                [ -n "$f" ] && span_name="$tool_name: $(basename "$f")"
-                ;;
-            Bash|Terminal)
-                c=$(echo "$tool_input" | jq -r '.command // empty' 2>/dev/null)
-                span_name="Terminal: ${c:-cmd}"
-                ;;
-        esac
         input_json=$(echo "$tool_input" | jq -c '.' 2>/dev/null | jq -Rs '.')
         output_json=$(echo "$tool_output" | jq -Rs '.')
         attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" \
             '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name}')")
-        span=$(build_otlp_span "$TRACE_ID" "$span_id" "$TASK_SPAN_ID" "$span_name" "tool" "$start_time" "$end_time" "$attrs" 20)
+        span=$(build_otlp_span "$TRACE_ID" "$span_id" "$TASK_SPAN_ID" "$tool_name" "tool" "$start_time" "$end_time" "$attrs" 20)
         if insert_span "$PROJECT_ID" "$span" >/dev/null; then
             TOOL_CALLS=$((TOOL_CALLS + 1))
-            log "INFO" "Tool span: $span_name ($(( (end_time - start_time) / 1000000 ))ms)"
+            log "INFO" "Tool span: $tool_name ($(( (end_time - start_time) / 1000000 ))ms)"
         fi
     }
 
