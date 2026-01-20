@@ -29,28 +29,22 @@ PROJECT_ID=$(get_session_state "$TRACE_ID" "project_id")
 
 [ -z "$ROOT_SPAN_ID" ] || [ -z "$PROJECT_ID" ] && { debug "Missing trace state"; exit 0; }
 
-TURN_COUNT=$(get_session_state "$TRACE_ID" "turn_count")
-TURN_COUNT=$((${TURN_COUNT:-0} + 1))
-
-TURN_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
+TASK_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
 START_TIME=$(get_time_nanos)
 PROMPT_JSON=$(echo "$PROMPT" | jq -Rs '.')
 
 ATTRIBUTES=$(build_otlp_attributes "$(jq -n \
     --arg span_kind "task" \
     --argjson input "$PROMPT_JSON" \
-    --argjson turn "$TURN_COUNT" \
     --arg session_id "$SESSION_ID" \
-    '{ "judgment.span_kind": $span_kind, "judgment.input": $input, "turn_number": $turn, "session_id": $session_id }')")
+    '{ "judgment.span_kind": $span_kind, "judgment.input": $input, "session_id": $session_id }')")
 
-SPAN=$(build_otlp_span "$TRACE_ID" "$TURN_SPAN_ID" "$ROOT_SPAN_ID" "Turn $TURN_COUNT" "task" "$START_TIME" "$START_TIME" "$ATTRIBUTES" 0)
-insert_span "$PROJECT_ID" "$SPAN" || { log "ERROR" "Failed to create turn span"; exit 0; }
+SPAN=$(build_otlp_span "$TRACE_ID" "$TASK_SPAN_ID" "$ROOT_SPAN_ID" "Task" "task" "$START_TIME" "$START_TIME" "$ATTRIBUTES" 0)
+insert_span "$PROJECT_ID" "$SPAN" || { log "ERROR" "Failed to create task span"; exit 0; }
 
 set_session_state_batch "$TRACE_ID" \
-    "turn_count" "$TURN_COUNT" \
-    "current_turn_span_id" "$TURN_SPAN_ID" \
-    "current_turn_start" "$START_TIME" \
-    "current_turn_tool_count" "0"
+    "current_task_span_id" "$TASK_SPAN_ID" \
+    "current_task_start" "$START_TIME"
 
-log "INFO" "Turn $TURN_COUNT started: span=$TURN_SPAN_ID"
+log "INFO" "Task started: span=$TASK_SPAN_ID"
 exit 0

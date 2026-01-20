@@ -60,7 +60,6 @@ set_session_state_batch "$TRACE_ID" \
     "session_id" "$SESSION_ID" \
     "root_span_id" "$SPAN_ID" \
     "project_id" "$PROJECT_ID" \
-    "turn_count" "0" \
     "started" "$START_TIME"
 
 # Also store current trace_id for other hooks to find
