@@ -1,6 +1,7 @@
 #!/bin/bash
 ###
 # SessionStart Hook - Creates root trace span when session begins
+# Each invocation gets a new trace_id; session_id stored as attribute for grouping
 ###
 
 set -e
@@ -23,10 +24,8 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 PROJECT_ID=$(get_project_id "$PROJECT") || { log "ERROR" "Failed to get project"; exit 0; }
 debug "Using project: $PROJECT (id: $PROJECT_ID)"
 
-EXISTING_ROOT=$(get_session_state "$SESSION_ID" "root_span_id")
-[ -n "$EXISTING_ROOT" ] && { debug "Session already has root span"; exit 0; }
-
-TRACE_ID=$(echo "$SESSION_ID" | sed 's/-//g' | head -c 32)
+# Always create new trace for each invocation
+TRACE_ID=$(generate_uuid | sed 's/-//g' | head -c 32)
 while [ ${#TRACE_ID} -lt 32 ]; do TRACE_ID="${TRACE_ID}0"; done
 SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
 
@@ -56,13 +55,16 @@ ATTRIBUTES=$(build_otlp_attributes "$(jq -n \
 SPAN=$(build_otlp_span "$TRACE_ID" "$SPAN_ID" "" "Claude Code: $WORKSPACE_NAME" "task" "$START_TIME" "$START_TIME" "$ATTRIBUTES" 0)
 insert_span "$PROJECT_ID" "$SPAN" || { log "ERROR" "Failed to create session root"; exit 0; }
 
-set_session_state_batch "$SESSION_ID" \
-    "trace_id" "$TRACE_ID" \
+# Store state for this invocation (keyed by trace_id, not session_id)
+set_session_state_batch "$TRACE_ID" \
+    "session_id" "$SESSION_ID" \
     "root_span_id" "$SPAN_ID" \
     "project_id" "$PROJECT_ID" \
     "turn_count" "0" \
-    "tool_count" "0" \
     "started" "$START_TIME"
 
-log "INFO" "Created session: trace=$TRACE_ID workspace=$WORKSPACE_NAME"
+# Also store current trace_id for other hooks to find
+set_state_value "current_trace_id" "$TRACE_ID"
+
+log "INFO" "Created trace: $TRACE_ID (session=$SESSION_ID)"
 exit 0

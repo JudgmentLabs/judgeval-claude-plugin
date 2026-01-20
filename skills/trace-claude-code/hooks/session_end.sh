@@ -1,6 +1,7 @@
 #!/bin/bash
 ###
-# SessionEnd Hook - Creates LLM/Tool spans and finalizes session
+# SessionEnd Hook - Creates LLM/Tool spans and finalizes trace
+# Processes full transcript each time (no line tracking needed)
 ###
 
 set -e
@@ -18,19 +19,19 @@ debug "SessionEnd input: $(echo "$INPUT" | jq -c '.' 2>/dev/null | head -c 500)"
 echo "$INPUT" | jq -e '.' >/dev/null 2>&1 || { debug "Invalid JSON"; exit 0; }
 
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
-[ -z "$SESSION_ID" ] && SESSION_ID=$(load_state | jq -r '.sessions | keys | .[-1] // empty' 2>/dev/null)
-[ -z "$SESSION_ID" ] && { debug "No session ID"; exit 0; }
 
-TRACE_ID=$(get_session_state "$SESSION_ID" "trace_id")
-ROOT_SPAN_ID=$(get_session_state "$SESSION_ID" "root_span_id")
-PROJECT_ID=$(get_session_state "$SESSION_ID" "project_id")
-TURN_SPAN_ID=$(get_session_state "$SESSION_ID" "current_turn_span_id")
-TURN_START=$(get_session_state "$SESSION_ID" "current_turn_start")
-TURN_COUNT=$(get_session_state "$SESSION_ID" "turn_count"); TURN_COUNT=${TURN_COUNT:-0}
-SESSION_START=$(get_session_state "$SESSION_ID" "started")
-TURN_LAST_LINE=$(get_session_state "$SESSION_ID" "turn_last_line"); TURN_LAST_LINE=${TURN_LAST_LINE:-0}
+# Get current trace from state
+TRACE_ID=$(get_state_value "current_trace_id")
+[ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
 
-[ -z "$TRACE_ID" ] || [ -z "$PROJECT_ID" ] && { debug "No trace/project"; exit 0; }
+ROOT_SPAN_ID=$(get_session_state "$TRACE_ID" "root_span_id")
+PROJECT_ID=$(get_session_state "$TRACE_ID" "project_id")
+TURN_SPAN_ID=$(get_session_state "$TRACE_ID" "current_turn_span_id")
+TURN_START=$(get_session_state "$TRACE_ID" "current_turn_start")
+TURN_COUNT=$(get_session_state "$TRACE_ID" "turn_count"); TURN_COUNT=${TURN_COUNT:-0}
+SESSION_START=$(get_session_state "$TRACE_ID" "started")
+
+[ -z "$ROOT_SPAN_ID" ] || [ -z "$PROJECT_ID" ] && { debug "No trace/project"; exit 0; }
 
 CONV_FILE=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 [ -z "$CONV_FILE" ] || [ ! -f "$CONV_FILE" ] && CONV_FILE=$(find "$HOME/.claude/projects" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
@@ -62,7 +63,7 @@ except: print('')
 }
 
 if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
-    debug "Processing transcript for pending turn"
+    debug "Processing transcript"
     
     LLM_CALLS=0
     TOOL_CALLS=0
@@ -74,7 +75,6 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     CURRENT_CACHE_READ=0
     LLM_START_TIME=""
     LLM_END_TIME=""
-    LINE_NUM=0
     CONVERSATION_HISTORY="[]"
     PENDING_TOOLS="{}"
     TURN_INPUT=""
@@ -133,8 +133,6 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     }
 
     while IFS= read -r line; do
-        LINE_NUM=$((LINE_NUM + 1))
-        [ "$LINE_NUM" -le "$TURN_LAST_LINE" ] && continue
         [ -z "$line" ] && continue
 
         MSG_TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
@@ -208,7 +206,6 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
                         TXT=$(echo "$CONTENT" | jq -r 'if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null)
                     fi
                     [ -n "$TXT" ] && CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg c "$TXT" '. += [{role: "user", content: $c}]')
-                    # Capture first user message as turn input
                     [ -z "$TURN_INPUT" ] && [ -n "$TXT" ] && TURN_INPUT="$TXT"
                 fi
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
@@ -252,15 +249,11 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     TURN_END=$(get_time_nanos)
     TURN_NUM=${TURN_COUNT:-1}
     TURN_INPUT_JSON=$(echo "${TURN_INPUT:-}" | jq -Rs '.')
-    TURN_ATTRS=$(build_otlp_attributes "$(jq -n --arg span_kind "task" --argjson input "$TURN_INPUT_JSON" --arg output "${CURRENT_OUTPUT:-Completed}" --argjson turn "$TURN_NUM" --argjson llm "$LLM_CALLS" --argjson tools "$TOOL_CALLS" \
-        '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "turn_number": $turn, "llm_call_count": $llm, "tool_count": $tools}')")
+    TURN_ATTRS=$(build_otlp_attributes "$(jq -n --arg span_kind "task" --argjson input "$TURN_INPUT_JSON" --arg output "${CURRENT_OUTPUT:-Completed}" --argjson turn "$TURN_NUM" --argjson llm "$LLM_CALLS" --argjson tools "$TOOL_CALLS" --arg session_id "$SESSION_ID" \
+        '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "turn_number": $turn, "llm_call_count": $llm, "tool_count": $tools, "session_id": $session_id}')")
     TURN_SPAN=$(build_otlp_span "$TRACE_ID" "$TURN_SPAN_ID" "$ROOT_SPAN_ID" "Turn $TURN_NUM" "task" "$TURN_START" "$TURN_END" "$TURN_ATTRS" 20)
     insert_span "$PROJECT_ID" "$TURN_SPAN" >/dev/null || debug "Failed to finalize turn"
 
-    # Update turn_last_line so resumed sessions don't re-process old lines
-    debug "Saving turn_last_line=$LINE_NUM for session $SESSION_ID"
-    set_session_state "$SESSION_ID" "turn_last_line" "$LINE_NUM"
-    
     [ "$LLM_CALLS" -gt 0 ] && log "INFO" "Created $LLM_CALLS LLM spans"
     [ "$TOOL_CALLS" -gt 0 ] && log "INFO" "Created $TOOL_CALLS tool spans"
     log "INFO" "Turn $TURN_NUM finalized"
@@ -268,10 +261,13 @@ fi
 
 END_TIME=$(get_time_nanos)
 SESSION_START=${SESSION_START:-$END_TIME}
-SESSION_ATTRS=$(build_otlp_attributes "$(jq -n --arg span_kind "task" --arg input "Session: $WORKSPACE_NAME" --arg output "Completed after $TURN_COUNT turns" --argjson turns "$TURN_COUNT" \
-    '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "turn_count": $turns, "source": "claude-code"}')")
+SESSION_ATTRS=$(build_otlp_attributes "$(jq -n --arg span_kind "task" --arg input "Session: $WORKSPACE_NAME" --arg output "Completed after $TURN_COUNT turns" --argjson turns "$TURN_COUNT" --arg session_id "$SESSION_ID" \
+    '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "turn_count": $turns, "session_id": $session_id, "source": "claude-code"}')")
 SESSION_SPAN=$(build_otlp_span "$TRACE_ID" "$ROOT_SPAN_ID" "" "Claude Code: $WORKSPACE_NAME" "task" "$SESSION_START" "$END_TIME" "$SESSION_ATTRS" 20)
 insert_span "$PROJECT_ID" "$SESSION_SPAN" || debug "Failed to finalize session"
 
-log "INFO" "Session ended: trace=$TRACE_ID turns=$TURN_COUNT"
+# Clear current trace (session ended)
+set_state_value "current_trace_id" ""
+
+log "INFO" "Trace ended: $TRACE_ID (session=$SESSION_ID, turns=$TURN_COUNT)"
 exit 0
