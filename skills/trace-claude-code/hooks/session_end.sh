@@ -29,7 +29,6 @@ TURN_START=$(get_session_state "$SESSION_ID" "current_turn_start")
 TURN_COUNT=$(get_session_state "$SESSION_ID" "turn_count"); TURN_COUNT=${TURN_COUNT:-0}
 SESSION_START=$(get_session_state "$SESSION_ID" "started")
 TURN_LAST_LINE=$(get_session_state "$SESSION_ID" "turn_last_line"); TURN_LAST_LINE=${TURN_LAST_LINE:-0}
-debug "Loaded state: session=$SESSION_ID turn_last_line=$TURN_LAST_LINE turn_count=$TURN_COUNT"
 
 [ -z "$TRACE_ID" ] || [ -z "$PROJECT_ID" ] && { debug "No trace/project"; exit 0; }
 
@@ -83,7 +82,6 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     create_llm_span() {
         local output="$1" model="$2" prompt="$3" completion="$4" history="$5"
         local cache_create="${6:-0}" cache_read="${7:-0}" start_time="$8" end_time="$9"
-        debug "create_llm_span: line=$LINE_NUM start=$start_time end=$end_time model=$model"
         [ -z "$output" ] && return
         local span_id span_start span_end input_json output_json attrs span duration_ms
         span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
@@ -136,14 +134,10 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
 
     while IFS= read -r line; do
         LINE_NUM=$((LINE_NUM + 1))
-        if [ "$LINE_NUM" -le "$TURN_LAST_LINE" ]; then
-            debug "Skipping line $LINE_NUM (last_line=$TURN_LAST_LINE)"
-            continue
-        fi
+        [ "$LINE_NUM" -le "$TURN_LAST_LINE" ] && continue
         [ -z "$line" ] && continue
 
         MSG_TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
-        debug "Processing line $LINE_NUM: type=$MSG_TYPE"
         TIMESTAMP=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
 
         if [ "$MSG_TYPE" = "user" ]; then
