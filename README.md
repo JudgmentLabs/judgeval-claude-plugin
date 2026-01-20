@@ -13,7 +13,7 @@ claude plugin install trace-claude-code@judgeval-claude-plugin
 **Step 2: Setup tracing in your project**
 ```bash
 cd /path/to/your/project
-curl -s https://raw.githubusercontent.com/JudgmentLabs/judgeval-claude-plugin/main/skills/trace-claude-code/setup.sh | bash
+bash <(curl -s https://raw.githubusercontent.com/JudgmentLabs/judgeval-claude-plugin/main/install.sh)
 ```
 
 The setup script will prompt for:
