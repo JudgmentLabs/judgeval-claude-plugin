@@ -90,10 +90,18 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
             --arg span_kind "llm" --argjson input "$input_json" --argjson output "$output_json" \
             --arg model "${model:-claude}" --argjson prompt "$prompt" --argjson completion "$completion" \
             --argjson cache_create "$cache_create" --argjson cache_read "$cache_read" \
-            '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output,
-              "judgment.llm.model": $model, "judgment.llm.provider": "anthropic",
-              "judgment.usage.non_cached_input_tokens": $prompt, "judgment.usage.output_tokens": $completion,
-              "judgment.usage.cache_creation_input_tokens": $cache_create, "judgment.usage.cache_read_input_tokens": $cache_read}')")
+            '{
+              "judgment.span_kind": $span_kind,
+              "judgment.input": $input,
+              "judgment.output": $output,
+              "judgment.llm.provider": "anthropic",
+              "judgment.llm.model": $model,
+              "judgment.usage.non_cached_input_tokens": $prompt,
+              "judgment.usage.output_tokens": $completion,
+              "judgment.usage.cache_creation_input_tokens": $cache_create,
+              "judgment.usage.cache_read_input_tokens": $cache_read,
+              "judgment.usage.reasoning_tokens": 0
+            }')")
         span=$(build_otlp_span "$TRACE_ID" "$span_id" "$TASK_SPAN_ID" "${model:-anthropic.messages.create}" "llm" "$span_start" "$span_end" "$attrs" 20)
         duration_ms=$(( (span_end - span_start) / 1000000 ))
         if insert_span "$PROJECT_ID" "$span" >/dev/null; then
