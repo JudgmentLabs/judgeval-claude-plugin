@@ -29,6 +29,7 @@ TURN_START=$(get_session_state "$SESSION_ID" "current_turn_start")
 TURN_COUNT=$(get_session_state "$SESSION_ID" "turn_count"); TURN_COUNT=${TURN_COUNT:-0}
 SESSION_START=$(get_session_state "$SESSION_ID" "started")
 TURN_LAST_LINE=$(get_session_state "$SESSION_ID" "turn_last_line"); TURN_LAST_LINE=${TURN_LAST_LINE:-0}
+debug "Loaded state: session=$SESSION_ID turn_last_line=$TURN_LAST_LINE turn_count=$TURN_COUNT"
 
 [ -z "$TRACE_ID" ] || [ -z "$PROJECT_ID" ] && { debug "No trace/project"; exit 0; }
 
