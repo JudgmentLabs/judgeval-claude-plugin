@@ -1,6 +1,6 @@
 # Judgeval Claude Code Plugin
 
-Claude Code plugin for Judgeval - automatic tracing and observability.
+Claude Code plugin for automatic tracing and observability with [Judgeval](https://judgmentlabs.ai).
 
 ## Install
 
@@ -10,6 +10,18 @@ claude plugin install trace-claude-code@judgeval-claude-plugin
 ```
 
 See [trace-claude-code/SKILL.md](skills/trace-claude-code/SKILL.md) for setup instructions.
+
+## Setup
+
+After installing, run the setup script in your project directory:
+
+```bash
+bash ~/.claude/plugins/marketplaces/judgeval-claude-plugin/skills/trace-claude-code/setup.sh
+```
+
+You'll need:
+- `JUDGMENT_API_KEY` - Get from [Judgeval Settings](https://app.judgmentlabs.ai/settings/api-keys)
+- `JUDGMENT_ORG_ID` - Get from [Organization Settings](https://app.judgmentlabs.ai/settings/organization)
 
 ## What You Get
 
@@ -37,31 +49,27 @@ Claude Code Session (root trace)
 
 ## View Traces
 
-After a Claude Code session:
+After a Claude Code session, view traces at:
+
 ```
 https://app.judgmentlabs.ai/projects/claude-code/traces
-```
-
-## Project Structure
-
-```
-judgeval-claude-plugin/
-├── .claude-plugin/
-│   ├── plugin.json
-│   └── marketplace.json
-├── skills/
-│   └── trace-claude-code/
-│       ├── SKILL.md
-│       ├── setup.sh
-│       └── hooks/
-└── README.md
 ```
 
 ## Development
 
 Test locally without marketplace:
+
 ```bash
 claude --plugin-dir /path/to/judgeval-claude-plugin
+```
+
+## Updating
+
+After plugin updates are released:
+
+```bash
+claude plugin marketplace update judgeval-claude-plugin
+claude plugin update trace-claude-code@judgeval-claude-plugin
 ```
 
 ## License
