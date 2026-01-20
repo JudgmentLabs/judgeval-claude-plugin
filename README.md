@@ -4,16 +4,16 @@ Automatic tracing for Claude Code conversations to [Judgeval](https://judgmentla
 
 ## Quick Start
 
+**Step 1: Install the plugin (once)**
 ```bash
-# 1. Add the marketplace (once)
 claude plugin marketplace add JudgmentLabs/judgeval-claude-plugin
-
-# 2. Install the plugin (once)
 claude plugin install trace-claude-code@judgeval-claude-plugin
+```
 
-# 3. Run setup in your project directory
+**Step 2: Setup tracing in your project**
+```bash
 cd /path/to/your/project
-~/.claude/plugins/cache/judgeval-claude-plugin/trace-claude-code/*/setup.sh
+curl -s https://raw.githubusercontent.com/JudgmentLabs/judgeval-claude-plugin/main/skills/trace-claude-code/setup.sh | bash
 ```
 
 The setup script will prompt for:
