@@ -4,19 +4,14 @@ Automatic tracing for Claude Code conversations to [Judgeval](https://judgmentla
 
 ## Quick Start
 
-**Step 1: Install the plugin (once)**
 ```bash
-claude plugin marketplace add JudgmentLabs/judgeval-claude-plugin
-claude plugin install trace-claude-code@judgeval-claude-plugin
+# In your project directory
+git clone https://github.com/JudgmentLabs/judgeval-claude-plugin /tmp/jcp
+bash /tmp/jcp/skills/trace-claude-code/setup.sh
+rm -rf /tmp/jcp
 ```
 
-**Step 2: Setup tracing in your project**
-```bash
-cd /path/to/your/project
-bash <(curl -s https://raw.githubusercontent.com/JudgmentLabs/judgeval-claude-plugin/main/install.sh)
-```
-
-The setup script will prompt for:
+Setup will prompt for:
 - **JUDGMENT_API_KEY** - Get from [Judgeval Settings](https://app.judgmentlabs.ai/settings/api-keys)
 - **JUDGMENT_ORG_ID** - Get from [Organization Settings](https://app.judgmentlabs.ai/settings/organization)
 - **Project name** - Where traces appear (default: `claude-code`)
