@@ -257,6 +257,10 @@ if [ -n "$TURN_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     TURN_SPAN=$(build_otlp_span "$TRACE_ID" "$TURN_SPAN_ID" "$ROOT_SPAN_ID" "Turn $TURN_NUM" "task" "$TURN_START" "$TURN_END" "$TURN_ATTRS" 20)
     insert_span "$PROJECT_ID" "$TURN_SPAN" >/dev/null || debug "Failed to finalize turn"
 
+    # Update turn_last_line so resumed sessions don't re-process old lines
+    debug "Saving turn_last_line=$LINE_NUM for session $SESSION_ID"
+    set_session_state "$SESSION_ID" "turn_last_line" "$LINE_NUM"
+    
     [ "$LLM_CALLS" -gt 0 ] && log "INFO" "Created $LLM_CALLS LLM spans"
     [ "$TOOL_CALLS" -gt 0 ] && log "INFO" "Created $TOOL_CALLS tool spans"
     log "INFO" "Turn $TURN_NUM finalized"
