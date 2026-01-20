@@ -19,7 +19,12 @@ mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_DIR"
 
 # Logging
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$1] $2" >> "$LOG_FILE"; }
-debug() { [ "$(echo "$DEBUG" | tr '[:upper:]' '[:lower:]')" = "true" ] && log "DEBUG" "$1" || true; }
+
+debug() {
+    if [ "$(echo "$DEBUG" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+        log "DEBUG" "$1"
+    fi
+}
 
 tracing_enabled() {
     [ "$(echo "$TRACE_TO_JUDGEVAL" | tr '[:upper:]' '[:lower:]')" = "true" ]
@@ -27,10 +32,19 @@ tracing_enabled() {
 
 check_requirements() {
     for cmd in jq curl; do
-        command -v "$cmd" &>/dev/null || { log "ERROR" "$cmd not installed"; return 1; }
+        if ! command -v "$cmd" &>/dev/null; then
+            log "ERROR" "$cmd not installed"
+            return 1
+        fi
     done
-    [ -z "$API_KEY" ] && { log "ERROR" "JUDGMENT_API_KEY not set"; return 1; }
-    [ -z "$ORG_ID" ] && { log "ERROR" "JUDGMENT_ORG_ID not set"; return 1; }
+    if [ -z "$API_KEY" ]; then
+        log "ERROR" "JUDGMENT_API_KEY not set"
+        return 1
+    fi
+    if [ -z "$ORG_ID" ]; then
+        log "ERROR" "JUDGMENT_ORG_ID not set"
+        return 1
+    fi
     return 0
 }
 
@@ -42,14 +56,18 @@ acquire_lock() {
     local timeout="${1:-5}"
     local count=0
     local max_attempts=$((timeout * 20))
+    local lock_age
     
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
         sleep 0.05
         count=$((count + 1))
         if [ "$count" -ge "$max_attempts" ]; then
             if [ -d "$LOCK_DIR" ]; then
-                local lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
-                [ "$lock_age" -gt 30 ] && { rmdir "$LOCK_DIR" 2>/dev/null || true; continue; }
+                lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
+                if [ "$lock_age" -gt 30 ]; then
+                    rmdir "$LOCK_DIR" 2>/dev/null || true
+                    continue
+                fi
             fi
             log "WARN" "Lock timeout after ${timeout}s"
             return 1
@@ -65,7 +83,9 @@ release_lock() {
 }
 
 with_lock() {
-    acquire_lock || return 1
+    if ! acquire_lock 5; then
+        return 1
+    fi
     local ret=0
     "$@" || ret=$?
     release_lock
@@ -77,7 +97,11 @@ with_lock() {
 ###
 
 load_state() {
-    [ -f "$STATE_FILE" ] && cat "$STATE_FILE" 2>/dev/null || echo "{}"
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE" 2>/dev/null
+    else
+        echo "{}"
+    fi
 }
 
 save_state() {
@@ -95,7 +119,8 @@ set_state_value() {
 }
 
 _set_state_value_unsafe() {
-    local state=$(load_state)
+    local state
+    state=$(load_state)
     save_state "$(echo "$state" | jq --arg k "$1" --arg v "$2" '.[$k] = $v')"
 }
 
@@ -108,7 +133,8 @@ set_session_state() {
 }
 
 _set_session_state_unsafe() {
-    local state=$(load_state)
+    local state
+    state=$(load_state)
     save_state "$(echo "$state" | jq --arg s "$1" --arg k "$2" --arg v "$3" \
         '.sessions[$s] = (.sessions[$s] // {}) | .sessions[$s][$k] = $v')"
 }
@@ -122,9 +148,11 @@ set_session_state_batch() {
 _set_session_state_batch_unsafe() {
     local session_id="$1"
     shift
-    local state=$(load_state)
+    local state key val
+    state=$(load_state)
     while [ $# -ge 2 ]; do
-        local key="$1" val="$2"
+        key="$1"
+        val="$2"
         state=$(echo "$state" | jq --arg s "$session_id" --arg k "$key" --arg v "$val" \
             '.sessions[$s] = (.sessions[$s] // {}) | .sessions[$s][$k] = $v')
         shift 2
@@ -138,7 +166,8 @@ _set_session_state_batch_unsafe() {
 
 queue_span() {
     local project_id="$1" span_json="$2"
-    local queue_file="$QUEUE_DIR/span_$(date +%s%N)_$$.json"
+    local queue_file
+    queue_file="$QUEUE_DIR/span_$(date +%s%N)_$$.json"
     jq -n --arg pid "$project_id" --argjson span "$span_json" '{project_id: $pid, span: $span}' > "$queue_file"
     debug "Queued span: $(echo "$span_json" | jq -c '.name')"
 }
@@ -148,17 +177,21 @@ process_queue_background() {
         exec >/dev/null 2>&1
         for queue_file in "$QUEUE_DIR"/span_*.json; do
             [ -f "$queue_file" ] || continue
-            local data=$(cat "$queue_file")
-            local project_id=$(echo "$data" | jq -r '.project_id')
-            local span_json=$(echo "$data" | jq -c '.span')
-            _insert_span_sync "$project_id" "$span_json" && rm -f "$queue_file"
+            local data project_id span_json
+            data=$(cat "$queue_file")
+            project_id=$(echo "$data" | jq -r '.project_id')
+            span_json=$(echo "$data" | jq -c '.span')
+            if _insert_span_sync "$project_id" "$span_json"; then
+                rm -f "$queue_file"
+            fi
         done
     ) &
 }
 
 _insert_span_sync() {
     local project_id="$1" span_json="$2"
-    local otlp_payload=$(jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
+    local otlp_payload resp http_code
+    otlp_payload=$(jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
         resourceSpans: [{
             resource: { attributes: [
                 { key: "service.name", value: { stringValue: $service_name } },
@@ -169,7 +202,7 @@ _insert_span_sync() {
         }]
     }')
 
-    local resp=$(curl -s -w "\n%{http_code}" -X POST \
+    resp=$(curl -s -w "\n%{http_code}" -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "X-Project-Id: $project_id" \
@@ -177,7 +210,7 @@ _insert_span_sync() {
         -d "$otlp_payload" \
         "$API_URL/otel/v1/traces" 2>&1)
 
-    local http_code=$(echo "$resp" | tail -1)
+    http_code=$(echo "$resp" | tail -1)
     [[ "$http_code" =~ ^20[012]$ ]]
 }
 
@@ -192,7 +225,8 @@ insert_span() {
         return 0
     fi
 
-    local otlp_payload=$(jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
+    local otlp_payload resp http_code
+    otlp_payload=$(jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
         resourceSpans: [{
             resource: { attributes: [
                 { key: "service.name", value: { stringValue: $service_name } },
@@ -203,7 +237,7 @@ insert_span() {
         }]
     }')
 
-    local resp=$(curl -s -w "\n%{http_code}" -X POST \
+    resp=$(curl -s -w "\n%{http_code}" -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "X-Project-Id: $project_id" \
@@ -211,7 +245,7 @@ insert_span() {
         -d "$otlp_payload" \
         "$API_URL/otel/v1/traces" 2>&1)
 
-    local http_code=$(echo "$resp" | tail -1)
+    http_code=$(echo "$resp" | tail -1)
     
     if [[ "$http_code" =~ ^20[012]$ ]]; then
         debug "OTLP insert successful (HTTP $http_code)"
@@ -229,8 +263,12 @@ insert_span() {
 
 get_project_id() {
     local name="$1"
-    local cached_id=$(get_state_value "project_id")
-    [ -n "$cached_id" ] && { echo "$cached_id"; return 0; }
+    local cached_id
+    cached_id=$(get_state_value "project_id")
+    if [ -n "$cached_id" ]; then
+        echo "$cached_id"
+        return 0
+    fi
 
     debug "Resolving project: $name"
     local resp pid
@@ -282,10 +320,11 @@ get_time_nanos() {
 
 build_otlp_span() {
     local trace_id="$1" span_id="$2" parent_span_id="$3" name="$4"
-    local kind="$5" start_time="$6" end_time="$7" attributes_json="$8"
+    local _kind="$5" start_time="$6" end_time="$7" attributes_json="$8"
     local update_id="${9:-0}"
 
-    local attrs_with_update=$(echo "$attributes_json" | jq --argjson uid "$update_id" \
+    local attrs_with_update
+    attrs_with_update=$(echo "$attributes_json" | jq --argjson uid "$update_id" \
         '. + [{"key": "judgment.update_id", "value": {"intValue": ($uid | tostring)}}]')
 
     jq -n \
