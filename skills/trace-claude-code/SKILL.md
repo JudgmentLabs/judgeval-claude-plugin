@@ -17,6 +17,10 @@ Session (task span)
 ├── Turn 1 (task span)
 │   ├── claude-opus-4-5 (llm span)
 │   ├── Read: file.py (tool span)
+│   ├── Subagent: code-reviewer (task span)  ← Subagent with nested spans
+│   │   ├── claude-3-5-haiku (llm span)
+│   │   ├── Read (tool span)
+│   │   └── claude-3-5-haiku (llm span)
 │   └── claude-opus-4-5 (llm span)
 └── Turn 2 (task span)
     └── ...
@@ -54,9 +58,10 @@ This will prompt you for:
 |------|---------|--------|
 | `session_start.sh` | Session begins | Creates root trace span |
 | `user_prompt_submit.sh` | User sends prompt | Creates Turn span |
-| `post_tool_use.sh` | Tool completes | Creates Tool span |
-| `stop_hook.sh` | Response complete | Creates LLM spans, finalizes Turn |
-| `session_end.sh` | Session ends | Finalizes session span |
+| `post_tool_use.sh` | Tool completes | Tracks tool count |
+| `stop_hook.sh` | Response complete | Marks turn for finalization |
+| `subagent_stop.sh` | Subagent completes | Parses subagent transcript, creates nested spans |
+| `session_end.sh` | Session ends | Creates LLM/Tool spans, finalizes session |
 
 ## Span Attributes
 

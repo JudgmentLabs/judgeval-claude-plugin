@@ -36,32 +36,10 @@ CONV_FILE=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 WORKSPACE=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
 WORKSPACE_NAME=$(basename "$WORKSPACE" 2>/dev/null || echo "Claude Code")
 
-iso_to_nanos() {
-    local ts="$1"
-    if [ -z "$ts" ]; then
-        get_time_nanos
-        return
-    fi
-    if command -v python3 &>/dev/null; then
-        local result
-        result=$(python3 -c "
-from datetime import datetime
-try:
-    ts = '${ts}'.replace('Z', '+00:00')
-    print(int(datetime.fromisoformat(ts).timestamp() * 1e9))
-except: print('')
-" 2>/dev/null)
-        if [ -n "$result" ]; then
-            echo "$result"
-            return
-        fi
-    fi
-    get_time_nanos
-}
-
 if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     debug "Processing transcript"
     
+    # Transcript parsing state
     LLM_CALLS=0
     TOOL_CALLS=0
     CURRENT_OUTPUT=""
@@ -75,18 +53,6 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
     CONVERSATION_HISTORY="[]"
     PENDING_TOOLS="{}"
     TASK_INPUT=""
-
-    detect_provider() {
-        local model="$1"
-        case "$model" in
-            anthropic/*|claude-*) echo "anthropic" ;;
-            openai/*|gpt-*) echo "openai" ;;
-            google/*|gemini-*) echo "google" ;;
-            meta-llama/*|llama-*) echo "meta" ;;
-            */*) echo "openrouter" ;;
-            *) echo "anthropic" ;;
-        esac
-    }
 
     create_llm_span() {
         local output="$1" model="$2" prompt="$3" completion="$4" history="$5"

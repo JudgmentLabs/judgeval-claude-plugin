@@ -51,7 +51,8 @@ ATTRIBUTES=$(build_otlp_attributes "$(jq -n \
     }')")
 
 SPAN=$(build_otlp_span "$TRACE_ID" "$SPAN_ID" "" "Claude Code: $WORKSPACE_NAME" "task" "$START_TIME" "$START_TIME" "$ATTRIBUTES" 0)
-insert_span "$PROJECT_ID" "$SPAN" || { log "ERROR" "Failed to create session root"; exit 0; }
+# Use sync here - we need to ensure root span exists before continuing
+insert_span_sync "$PROJECT_ID" "$SPAN" || { log "ERROR" "Failed to create session root"; exit 0; }
 
 set_session_state_batch "$TRACE_ID" \
     "session_id" "$SESSION_ID" \

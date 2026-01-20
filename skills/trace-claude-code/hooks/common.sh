@@ -1,21 +1,17 @@
 #!/bin/bash
-###
 # Common utilities for Judgeval Claude Code tracing hooks
-# Uses OTLP HTTP/JSON format to export spans to Judgment Labs API
-###
 
-# Config
+# Configuration
 export LOG_FILE="$HOME/.claude/state/judgeval_hook.log"
 export STATE_FILE="$HOME/.claude/state/judgeval_state.json"
 export LOCK_DIR="$HOME/.claude/state/judgeval.lock.d"
-export QUEUE_DIR="$HOME/.claude/state/judgeval_queue"
 export DEBUG="${JUDGEVAL_CC_DEBUG:-false}"
 export API_KEY="${JUDGMENT_API_KEY}"
 export ORG_ID="${JUDGMENT_ORG_ID}"
 export PROJECT="${JUDGEVAL_CC_PROJECT:-claude-code}"
 export API_URL="${JUDGMENT_API_URL:-https://api.judgmentlabs.ai}"
 
-mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_DIR"
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
 
 # Logging
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$1] $2" >> "$LOG_FILE"; }
@@ -48,10 +44,7 @@ check_requirements() {
     return 0
 }
 
-###
-# File Locking - mkdir-based (atomic on all POSIX systems)
-###
-
+# File Locking (mkdir-based, atomic on POSIX)
 acquire_lock() {
     local timeout="${1:-5}"
     local count=0
@@ -92,10 +85,7 @@ with_lock() {
     return $ret
 }
 
-###
-# State Management - Atomic operations
-###
-
+# State Management
 load_state() {
     if [ -f "$STATE_FILE" ]; then
         cat "$STATE_FILE" 2>/dev/null
@@ -160,38 +150,10 @@ _set_session_state_batch_unsafe() {
     save_state "$state"
 }
 
-###
 # API Operations
-###
-
-queue_span() {
-    local project_id="$1" span_json="$2"
-    local queue_file
-    queue_file="$QUEUE_DIR/span_$(date +%s%N)_$$.json"
-    jq -n --arg pid "$project_id" --argjson span "$span_json" '{project_id: $pid, span: $span}' > "$queue_file"
-    debug "Queued span: $(echo "$span_json" | jq -c '.name')"
-}
-
-process_queue_background() {
-    (
-        exec >/dev/null 2>&1
-        for queue_file in "$QUEUE_DIR"/span_*.json; do
-            [ -f "$queue_file" ] || continue
-            local data project_id span_json
-            data=$(cat "$queue_file")
-            project_id=$(echo "$data" | jq -r '.project_id')
-            span_json=$(echo "$data" | jq -c '.span')
-            if _insert_span_sync "$project_id" "$span_json"; then
-                rm -f "$queue_file"
-            fi
-        done
-    ) &
-}
-
-_insert_span_sync() {
-    local project_id="$1" span_json="$2"
-    local otlp_payload resp http_code
-    otlp_payload=$(jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
+_build_otlp_payload() {
+    local span_json="$1"
+    jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
         resourceSpans: [{
             resource: { attributes: [
                 { key: "service.name", value: { stringValue: $service_name } },
@@ -200,51 +162,28 @@ _insert_span_sync() {
             ]},
             scopeSpans: [{ scope: { name: "judgeval" }, spans: [$span] }]
         }]
-    }')
-
-    resp=$(curl -s -w "\n%{http_code}" -X POST \
-        -H "Authorization: Bearer $API_KEY" \
-        -H "X-Organization-Id: $ORG_ID" \
-        -H "X-Project-Id: $project_id" \
-        -H "Content-Type: application/json" \
-        -d "$otlp_payload" \
-        "$API_URL/otel/v1/traces" 2>&1)
-
-    http_code=$(echo "$resp" | tail -1)
-    [[ "$http_code" =~ ^20[012]$ ]]
+    }'
 }
 
 insert_span() {
-    local project_id="$1" span_json="$2" async="${3:-false}"
-    debug "Inserting span: $(echo "$span_json" | jq -c '.name')"
-
-    if [ "$async" = "true" ]; then
-        queue_span "$project_id" "$span_json"
-        process_queue_background
-        echo "queued"
-        return 0
-    fi
-
+    local project_id="$1" span_json="$2"
     local otlp_payload resp http_code
-    otlp_payload=$(jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
-        resourceSpans: [{
-            resource: { attributes: [
-                { key: "service.name", value: { stringValue: $service_name } },
-                { key: "telemetry.sdk.name", value: { stringValue: "judgeval" } },
-                { key: "telemetry.sdk.version", value: { stringValue: "1.0.0" } }
-            ]},
-            scopeSpans: [{ scope: { name: "judgeval" }, spans: [$span] }]
-        }]
-    }')
-
-    resp=$(curl -s -w "\n%{http_code}" -X POST \
+    
+    debug "Inserting span: $(echo "$span_json" | jq -c '.name' 2>/dev/null)"
+    
+    otlp_payload=$(_build_otlp_payload "$span_json")
+    
+    resp=$(curl -s -w "\n%{http_code}" \
+        --max-time 5 \
+        --connect-timeout 3 \
+        -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "X-Project-Id: $project_id" \
         -H "Content-Type: application/json" \
         -d "$otlp_payload" \
         "$API_URL/otel/v1/traces" 2>&1)
-
+    
     http_code=$(echo "$resp" | tail -1)
     
     if [[ "$http_code" =~ ^20[012]$ ]]; then
@@ -252,15 +191,18 @@ insert_span() {
         echo "success"
         return 0
     fi
-
-    log "ERROR" "OTLP insert failed (HTTP $http_code)"
+    
+    log "WARN" "OTLP insert failed (HTTP $http_code)"
+    echo "failed"
     return 1
 }
 
-###
-# Project Resolution
-###
+# Alias for backward compatibility
+insert_span_sync() {
+    insert_span "$@"
+}
 
+# Project Resolution
 get_project_id() {
     local name="$1"
     local cached_id
@@ -306,10 +248,7 @@ get_project_id() {
     return 1
 }
 
-###
-# Span Building
-###
-
+# Time Utilities
 get_time_nanos() {
     if command -v python3 &>/dev/null; then
         python3 -c "import time; print(int(time.time() * 1e9))"
@@ -318,9 +257,39 @@ get_time_nanos() {
     fi
 }
 
+iso_to_nanos() {
+    local ts="$1"
+    [ -z "$ts" ] && { get_time_nanos; return; }
+    
+    if command -v python3 &>/dev/null; then
+        local result
+        result=$(python3 -c "
+from datetime import datetime
+try:
+    ts = '${ts}'.replace('Z', '+00:00')
+    print(int(datetime.fromisoformat(ts).timestamp() * 1e9))
+except: print('')
+" 2>/dev/null)
+        [ -n "$result" ] && { echo "$result"; return; }
+    fi
+    get_time_nanos
+}
+
+detect_provider() {
+    local model="$1"
+    case "$model" in
+        anthropic/*|claude-*) echo "anthropic" ;;
+        openai/*|gpt-*) echo "openai" ;;
+        google/*|gemini-*) echo "google" ;;
+        meta-llama/*|llama-*) echo "meta" ;;
+        */*) echo "openrouter" ;;
+        *) echo "anthropic" ;;
+    esac
+}
+
+# Span Building
 build_otlp_span() {
     local trace_id="$1" span_id="$2" parent_span_id="$3" name="$4"
-    # $5 is span kind (unused, hardcoded to 1=SPAN_KIND_INTERNAL)
     local start_time="$6" end_time="$7" attributes_json="$8" update_id="${9:-0}"
 
     local attrs_with_update
@@ -367,10 +336,7 @@ build_otlp_attributes() {
     '
 }
 
-###
 # Utilities
-###
-
 generate_uuid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
 get_hostname() { hostname 2>/dev/null || echo "unknown"; }
 get_username() { whoami 2>/dev/null || echo "unknown"; }
