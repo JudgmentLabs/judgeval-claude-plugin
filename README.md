@@ -1,162 +1,117 @@
-# Judgeval Claude plugins
+# Judgeval Claude Code Plugin
 
-Claude Code plugins for Judgeval - LLM evaluation, logging, observability, and tracing.
+Automatic tracing for Claude Code conversations to [Judgeval](https://judgmentlabs.ai).
 
-## Plugins
-
-### 1. Judgeval (evaluation & logging)
-
-Enables AI agents to use Judgeval for LLM evaluation, logging, and observability.
+## Quick Start
 
 ```bash
-claude plugin marketplace add judgmentlabs/judgeval-claude-plugin
-claude plugin install judgeval@judgeval-claude-plugin
-```
+# 1. Add the marketplace (once)
+claude plugin marketplace add JudgmentLabs/judgeval-claude-plugin
 
-### 2. Trace Claude Code (observability)
-
-Automatically trace Claude Code conversations to Judgeval.
-
-```bash
+# 2. Install the plugin (once)
 claude plugin install trace-claude-code@judgeval-claude-plugin
+
+# 3. Run setup in your project directory
+cd /path/to/your/project
+~/.claude/plugins/cache/judgeval-claude-plugin/trace-claude-code/*/setup.sh
 ```
 
-See [trace-claude-code/SKILL.md](skills/trace-claude-code/SKILL.md) for setup instructions.
+The setup script will prompt for:
+- **JUDGMENT_API_KEY** - Get from [Judgeval Settings](https://app.judgmentlabs.ai/settings/api-keys)
+- **JUDGMENT_ORG_ID** - Get from [Organization Settings](https://app.judgmentlabs.ai/settings/organization)
+- **Project name** - Where traces appear (default: `claude-code`)
 
-## Agent skills
-
-This repo includes skills built on the open [Agent Skills](https://agentskills.io/home) format, compatible with Claude Code, Cursor, Amp, and other agents.
-
-**Install all skills:**
-```bash
-curl -sL https://github.com/judgmentlabs/judgeval-claude-plugin/archive/main.tar.gz | tar -xz -C ~/.claude/skills --strip-components=2 judgeval-claude-plugin-main/skills
-```
-
-Available skills:
-- [trace-claude-code](skills/trace-claude-code/SKILL.md) - Automatic conversation tracing
-
-## Setup
-
-Create a `.env` file in your project directory:
-
-```
-JUDGMENT_API_KEY=your-api-key-here
-JUDGMENT_ORG_ID=your-org-id-here
-```
-
-The plugin scripts automatically load `.env` files from the current directory or parent directories.
-
-## What the plugin provides
-
-### Tracing
-
-The trace-claude-code skill provides automatic tracing of Claude Code conversations:
+## What You Get
 
 ```
 Claude Code Session (root trace)
 ├── Turn 1: "Add error handling"
-│   ├── LLM: claude-opus-4-5
+│   ├── LLM: claude-opus-4-5 (3.2s, 1,240 tokens)
 │   ├── Read: src/app.ts
 │   ├── Edit: src/app.ts
-│   └── LLM: claude-opus-4-5
+│   └── LLM: claude-opus-4-5 (1.8s, 890 tokens)
 ├── Turn 2: "Now run the tests"
 │   ├── LLM: claude-opus-4-5
 │   ├── Terminal: npm test
 │   └── LLM: claude-opus-4-5
-└── Turn 3: "Great, commit this"
+└── Turn 3: "Commit this"
     └── ...
 ```
 
-**Features:**
-- Session, turn, and LLM span tracking
-- Token usage with cache metrics
-- Tool invocation logging
+**Captured data:**
+- Session start/end times
+- Each conversation turn
+- All LLM calls with model, tokens, and duration
+- Tool invocations (file reads, edits, terminal, MCP)
+- Cache metrics (creation + read tokens)
 
-### SDK Integration
+## View Traces
 
-For programmatic tracing, use the Judgeval SDK:
-
-```python
-from judgeval.v1 import Judgeval
-from judgeval.v1.integrations.claude_agent_sdk import setup_claude_agent_sdk
-
-judgeval = Judgeval()
-tracer = judgeval.tracer.create(project_name="my-project")
-setup_claude_agent_sdk(tracer)
-
-# Now use claude_agent_sdk - all calls automatically traced
+After a Claude Code session, view traces at:
+```
+https://app.judgmentlabs.ai/projects/claude-code/traces
 ```
 
-## Project structure
+## Troubleshooting
 
-```
-judgeval-claude-plugin/
-├── .claude-plugin/
-│   ├── plugin.json         # Plugin manifest
-│   └── marketplace.json    # Marketplace index
-├── skills/
-│   └── trace-claude-code/
-│       ├── SKILL.md        # Claude Code tracing skill
-│       ├── setup.sh        # Setup script
-│       └── hooks/
-│           ├── common.sh
-│           ├── session_start.sh
-│           ├── user_prompt_submit.sh
-│           ├── post_tool_use.sh
-│           ├── stop_hook.sh
-│           └── session_end.sh
-└── README.md
-```
-
-## Development
-
-### Prerequisites
-
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) package manager (optional)
-
-### Local testing
-
-Test the plugin without installing from marketplace:
-
+**Check hook logs:**
 ```bash
-claude --plugin-dir /path/to/judgeval-claude-plugin
+tail -f ~/.claude/state/judgeval_hook.log
 ```
 
-### Manual hook testing
+**Enable debug mode:**
+Re-run setup and answer "y" to debug logging, or edit `.claude/settings.local.json`:
+```json
+{
+  "env": {
+    "JUDGEVAL_CC_DEBUG": "true"
+  }
+}
+```
 
-You can test individual hooks by piping JSON input:
-
+**Reset state:**
 ```bash
-# Test session start
-echo '{"session_id": "test-123", "cwd": "/path/to/project"}' | \
-  TRACE_TO_JUDGEVAL=true \
-  JUDGMENT_API_KEY=your-key \
-  JUDGMENT_ORG_ID=your-org \
-  bash skills/trace-claude-code/hooks/session_start.sh
-
-# Check logs
-cat ~/.claude/state/judgeval_hook.log
+rm ~/.claude/state/judgeval_state.json
 ```
+
+**Verify hooks are configured:**
+```bash
+cat .claude/settings.local.json | jq '.hooks | keys'
+```
+
+## How It Works
+
+The plugin uses Claude Code's hook system:
+
+| Hook | What it does |
+|------|--------------|
+| SessionStart | Creates root trace span |
+| UserPromptSubmit | Creates Turn span for each message |
+| PostToolUse | Tracks tool call count |
+| Stop | Marks turn for finalization |
+| SessionEnd | Creates LLM/tool spans, finalizes trace |
+
+Hooks are configured per-project in `.claude/settings.local.json`.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TRACE_TO_JUDGEVAL` | Yes | Set to `"true"` to enable tracing |
-| `JUDGMENT_API_KEY` | Yes | Your Judgment API key |
-| `JUDGMENT_ORG_ID` | Yes | Your Judgment organization ID |
-| `JUDGEVAL_CC_PROJECT` | No | Project name (default: `claude-code`) |
-| `JUDGEVAL_CC_DEBUG` | No | Set to `"true"` for verbose logging |
-| `JUDGMENT_API_URL` | No | API URL (default: `https://api.judgmentlabs.ai`) |
+| `TRACE_TO_JUDGEVAL` | Yes | Set to `true` to enable |
+| `JUDGMENT_API_KEY` | Yes | API key |
+| `JUDGMENT_ORG_ID` | Yes | Organization ID |
+| `JUDGMENT_API_URL` | No | Default: `https://api.judgmentlabs.ai` |
+| `JUDGEVAL_CC_PROJECT` | No | Default: `claude-code` |
+| `JUDGEVAL_CC_DEBUG` | No | Set to `true` for verbose logs |
 
-## Updating the plugin
+## Updating
 
-After making changes:
+```bash
+claude plugin marketplace update judgeval-claude-plugin
+claude plugin update trace-claude-code@judgeval-claude-plugin
+```
 
-1. Bump version in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`
-2. Commit and push
-3. Users update with: `claude plugin marketplace update judgeval-claude-plugin`
+Then re-run setup in your project directories.
 
 ## License
 
