@@ -1,7 +1,6 @@
 #!/bin/bash
 ###
 # SessionEnd Hook - Creates LLM/Tool spans and finalizes trace
-# Processes full transcript each time (no line tracking needed)
 ###
 
 set -e
@@ -20,7 +19,6 @@ echo "$INPUT" | jq -e '.' >/dev/null 2>&1 || { debug "Invalid JSON"; exit 0; }
 
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 
-# Get current trace from state
 TRACE_ID=$(get_state_value "current_trace_id")
 [ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
 
@@ -227,10 +225,8 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
             fi
             TEXT=$(echo "$line" | jq -r '.message.content | if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null)
             [ -n "$TEXT" ] && CURRENT_OUTPUT="${CURRENT_OUTPUT:+$CURRENT_OUTPUT$'\n'}$TEXT"
-            # Model can be at .message.model or .model
             MODEL=$(echo "$line" | jq -r '.message.model // .model // empty' 2>/dev/null)
             [ -n "$MODEL" ] && CURRENT_MODEL="$MODEL"
-            # Usage can be at .message.usage, .usage, or root level
             USAGE=$(echo "$line" | jq -c '.message.usage // .usage // {input_tokens: .input_tokens, output_tokens: .output_tokens, cache_creation_input_tokens: .cache_creation_input_tokens, cache_read_input_tokens: .cache_read_input_tokens} | select(. != null)' 2>/dev/null)
             if [ -n "$USAGE" ] && [ "$USAGE" != "{}" ] && [ "$USAGE" != "null" ]; then
                 INP=$(echo "$USAGE" | jq -r '.input_tokens // 0')
@@ -266,7 +262,6 @@ SESSION_ATTRS=$(build_otlp_attributes "$(jq -n --arg span_kind "task" --arg inpu
 SESSION_SPAN=$(build_otlp_span "$TRACE_ID" "$ROOT_SPAN_ID" "" "Claude Code: $WORKSPACE_NAME" "task" "$SESSION_START" "$END_TIME" "$SESSION_ATTRS" 20)
 insert_span "$PROJECT_ID" "$SESSION_SPAN" || debug "Failed to finalize session"
 
-# Clear current trace (session ended)
 set_state_value "current_trace_id" ""
 
 log "INFO" "Trace ended: $TRACE_ID (session=$SESSION_ID)"

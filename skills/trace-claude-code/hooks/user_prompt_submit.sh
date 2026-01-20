@@ -1,6 +1,6 @@
 #!/bin/bash
 ###
-# UserPromptSubmit Hook - Creates Turn span when user submits a prompt
+# UserPromptSubmit Hook - Creates Task span when user submits a prompt
 ###
 
 set -e
@@ -20,7 +20,6 @@ echo "$INPUT" | jq -e '.' >/dev/null 2>&1 || { debug "Invalid JSON"; exit 0; }
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null)
 
-# Get current trace from state
 TRACE_ID=$(get_state_value "current_trace_id")
 [ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
 

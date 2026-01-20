@@ -320,8 +320,8 @@ get_time_nanos() {
 
 build_otlp_span() {
     local trace_id="$1" span_id="$2" parent_span_id="$3" name="$4"
-    local _kind="$5" start_time="$6" end_time="$7" attributes_json="$8"
-    local update_id="${9:-0}"
+    # $5 is span kind (unused, hardcoded to 1=SPAN_KIND_INTERNAL)
+    local start_time="$6" end_time="$7" attributes_json="$8" update_id="${9:-0}"
 
     local attrs_with_update
     attrs_with_update=$(echo "$attributes_json" | jq --argjson uid "$update_id" \
