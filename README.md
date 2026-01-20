@@ -47,14 +47,6 @@ Claude Code Session (root trace)
 - Tool invocations (file reads, edits, terminal, MCP)
 - Cache metrics (creation + read tokens)
 
-## View Traces
-
-After a Claude Code session, view traces at:
-
-```
-https://app.judgmentlabs.ai/projects/claude-code/traces
-```
-
 ## Development
 
 Test locally without marketplace:
