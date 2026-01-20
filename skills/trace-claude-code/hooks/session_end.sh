@@ -227,10 +227,12 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
             fi
             TEXT=$(echo "$line" | jq -r '.message.content | if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null)
             [ -n "$TEXT" ] && CURRENT_OUTPUT="${CURRENT_OUTPUT:+$CURRENT_OUTPUT$'\n'}$TEXT"
-            MODEL=$(echo "$line" | jq -r '.message.model // empty' 2>/dev/null)
+            # Model can be at .message.model or .model
+            MODEL=$(echo "$line" | jq -r '.message.model // .model // empty' 2>/dev/null)
             [ -n "$MODEL" ] && CURRENT_MODEL="$MODEL"
-            USAGE=$(echo "$line" | jq -c '.message.usage // {}' 2>/dev/null)
-            if [ "$USAGE" != "{}" ]; then
+            # Usage can be at .message.usage, .usage, or root level
+            USAGE=$(echo "$line" | jq -c '.message.usage // .usage // {input_tokens: .input_tokens, output_tokens: .output_tokens, cache_creation_input_tokens: .cache_creation_input_tokens, cache_read_input_tokens: .cache_read_input_tokens} | select(. != null)' 2>/dev/null)
+            if [ -n "$USAGE" ] && [ "$USAGE" != "{}" ] && [ "$USAGE" != "null" ]; then
                 INP=$(echo "$USAGE" | jq -r '.input_tokens // 0')
                 [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$((CURRENT_PROMPT_TOKENS + INP))
                 OUT=$(echo "$USAGE" | jq -r '.output_tokens // 0')
