@@ -24,7 +24,7 @@ echo "$INPUT" | jq -e '.' >/dev/null 2>&1 || { debug "Invalid JSON"; exit 0; }
 
 # Extract subagent info from hook input
 SUBAGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // .subagent_id // empty' 2>/dev/null)
-SUBAGENT_TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
+SUBAGENT_TRANSCRIPT=$(echo "$INPUT" | jq -r '.agent_transcript_path // empty' 2>/dev/null)
 TASK_DESCRIPTION=$(echo "$INPUT" | jq -r '.task // .description // empty' 2>/dev/null)
 PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // empty' 2>/dev/null)
 
@@ -218,12 +218,14 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
             MODEL=$(echo "$line" | jq -r '.message.model // .model // empty' 2>/dev/null)
             [ -n "$MODEL" ] && CURRENT_MODEL="$MODEL"
             
+            # Claude Code repeats the same cumulative usage on every assistant content block
+            # within a single API call, so use the latest values (replace) instead of accumulating
             USAGE=$(echo "$line" | jq -c '.message.usage // .usage // {}' 2>/dev/null)
             if [ -n "$USAGE" ] && [ "$USAGE" != "{}" ]; then
                 INP=$(echo "$USAGE" | jq -r '.input_tokens // 0')
-                [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$((CURRENT_PROMPT_TOKENS + INP))
+                [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$INP
                 OUT=$(echo "$USAGE" | jq -r '.output_tokens // 0')
-                [ "$OUT" != "null" ] && [ "$OUT" -gt 0 ] 2>/dev/null && CURRENT_COMPLETION_TOKENS=$((CURRENT_COMPLETION_TOKENS + OUT))
+                [ "$OUT" != "null" ] && [ "$OUT" -gt 0 ] 2>/dev/null && CURRENT_COMPLETION_TOKENS=$OUT
             fi
             
             # Save last output for subagent summary

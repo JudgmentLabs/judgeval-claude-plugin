@@ -85,7 +85,6 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
               "judgment.usage.output_tokens": $completion,
               "judgment.usage.cache_creation_input_tokens": $cache_create,
               "judgment.usage.cache_read_input_tokens": $cache_read,
-              "judgment.usage.reasoning_tokens": 0,
               "judgment.usage.metadata": $usage_meta
             }')")
         span=$(build_otlp_span "$TRACE_ID" "$span_id" "$TASK_SPAN_ID" "${model:-anthropic.messages.create}" "llm" "$span_start" "$span_end" "$attrs" 20)
@@ -210,16 +209,18 @@ if [ -n "$TASK_SPAN_ID" ] && [ -f "$CONV_FILE" ]; then
             [ -n "$TEXT" ] && CURRENT_OUTPUT="${CURRENT_OUTPUT:+$CURRENT_OUTPUT$'\n'}$TEXT"
             MODEL=$(echo "$line" | jq -r '.message.model // .model // empty' 2>/dev/null)
             [ -n "$MODEL" ] && CURRENT_MODEL="$MODEL"
+            # Claude Code repeats the same cumulative usage on every assistant content block
+            # within a single API call, so use the latest values (replace) instead of accumulating
             USAGE=$(echo "$line" | jq -c '.message.usage // .usage // {input_tokens: .input_tokens, output_tokens: .output_tokens, cache_creation_input_tokens: .cache_creation_input_tokens, cache_read_input_tokens: .cache_read_input_tokens} | select(. != null)' 2>/dev/null)
             if [ -n "$USAGE" ] && [ "$USAGE" != "{}" ] && [ "$USAGE" != "null" ]; then
                 INP=$(echo "$USAGE" | jq -r '.input_tokens // 0')
-                [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$((CURRENT_PROMPT_TOKENS + INP))
+                [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$INP
                 OUT=$(echo "$USAGE" | jq -r '.output_tokens // 0')
-                [ "$OUT" != "null" ] && [ "$OUT" -gt 0 ] 2>/dev/null && CURRENT_COMPLETION_TOKENS=$((CURRENT_COMPLETION_TOKENS + OUT))
+                [ "$OUT" != "null" ] && [ "$OUT" -gt 0 ] 2>/dev/null && CURRENT_COMPLETION_TOKENS=$OUT
                 CC=$(echo "$USAGE" | jq -r '.cache_creation_input_tokens // 0')
-                [ "$CC" != "null" ] && [ "$CC" -gt 0 ] 2>/dev/null && CURRENT_CACHE_CREATION=$((CURRENT_CACHE_CREATION + CC))
+                [ "$CC" != "null" ] && [ "$CC" -gt 0 ] 2>/dev/null && CURRENT_CACHE_CREATION=$CC
                 CR=$(echo "$USAGE" | jq -r '.cache_read_input_tokens // 0')
-                [ "$CR" != "null" ] && [ "$CR" -gt 0 ] 2>/dev/null && CURRENT_CACHE_READ=$((CURRENT_CACHE_READ + CR))
+                [ "$CR" != "null" ] && [ "$CR" -gt 0 ] 2>/dev/null && CURRENT_CACHE_READ=$CR
             fi
         fi
     done < "$CONV_FILE"
