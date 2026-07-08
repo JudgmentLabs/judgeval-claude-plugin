@@ -179,7 +179,8 @@ HOOKS_CONFIG=$(cat <<EOF
             "hooks": [
                 {
                     "type": "command",
-                    "command": "bash $HOOKS_DIR/session_end.sh"
+                    "command": "bash $HOOKS_DIR/session_end.sh",
+                    "timeout": 120
                 }
             ]
         }
