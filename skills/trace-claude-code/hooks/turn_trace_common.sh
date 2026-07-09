@@ -10,7 +10,7 @@ _turn_history_for_llm() {
     if echo "$history" | jq -e 'length > 0' >/dev/null 2>&1; then
         echo "$history"
     elif [ -n "${TURN_PROMPT:-}" ]; then
-        jq -cn --arg p "$TURN_PROMPT" '[{role: "user", content: $p}]'
+        jq -cn --rawfile p <(printf '%s' "$TURN_PROMPT") '[{role: "user", content: $p}]'
     else
         echo "[]"
     fi
@@ -28,10 +28,10 @@ _turn_llm_output_text() {
 _turn_append_assistant_history() {
     local history="$1" text="$2" tool_uses="$3"
     if echo "$tool_uses" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
-        echo "$history" | jq --arg c "$text" --argjson tools "$tool_uses" \
-            '. += [{role: "assistant", content: $tools, text: $c, tool_uses: $tools}]'
+        echo "$history" | jq --rawfile c <(printf '%s' "$text") --slurpfile tools_f <(printf '%s\n' "$tool_uses") \
+            '$tools_f[0] as $tools | . += [{role: "assistant", content: $tools, text: $c, tool_uses: $tools}]'
     else
-        echo "$history" | jq --arg c "$text" \
+        echo "$history" | jq --rawfile c <(printf '%s' "$text") \
             '. += [{role: "assistant", content: [{type: "text", text: $c}], text: $c}]'
     fi
 }
@@ -139,17 +139,17 @@ _turn_normalized_messages_through() {
 _turn_context_payload() {
     local messages_json="$1" current_output="${2:-}" include_output="${3:-false}"
     jq -cn \
-        --argjson messages "$messages_json" \
+        --slurpfile messages_f <(printf '%s\n' "$messages_json") \
         --arg session_id "$TURN_SESSION_ID" \
         --arg trace_id "$TURN_TRACE_ID" \
         --arg root_span_id "$TURN_ROOT_SPAN_ID" \
         --arg task_span_id "$TURN_TASK_SPAN_ID" \
         --argjson turn_index "${TURN_INDEX:-1}" \
         --arg workspace "${TURN_WORKSPACE:-}" \
-        --arg current_prompt "${TURN_PROMPT:-}" \
-        --arg output "$current_output" \
+        --rawfile current_prompt <(printf '%s' "${TURN_PROMPT:-}") \
+        --rawfile output <(printf '%s' "$current_output") \
         --arg include_output "$include_output" \
-        '{
+        '$messages_f[0] as $messages | {
           metadata: {
             session_id: $session_id,
             trace_id: $trace_id,
@@ -176,12 +176,12 @@ _turn_build_context_payloads() {
         all_messages=$(_turn_normalized_messages_through "$TURN_TRANSCRIPT_PATH" "${TURN_NEW_OFFSET:-0}" "all")
     else
         prior_messages="[]"
-        current_input_messages=$(jq -cn --arg p "${TURN_PROMPT:-}" '[{role: "user", content: [{type: "text", text: $p}], text: $p}]')
+        current_input_messages=$(jq -cn --rawfile p <(printf '%s' "${TURN_PROMPT:-}") '[{role: "user", content: [{type: "text", text: $p}], text: $p}]')
         current_output_messages="[]"
         all_messages="$current_input_messages"
     fi
 
-    input_messages=$(jq -cn --argjson prior "$prior_messages" --argjson current "$current_input_messages" '$prior + $current')
+    input_messages=$(jq -cn --slurpfile prior_f <(printf '%s\n' "$prior_messages") --slurpfile current_f <(printf '%s\n' "$current_input_messages") '$prior_f[0] + $current_f[0]')
     output_messages="$all_messages"
 
     TURN_CONTEXT_INPUT_JSON=$(_turn_context_payload "$input_messages" "" "false")
@@ -214,10 +214,10 @@ _turn_create_llm_span() {
 
     input_payload=$(_turn_context_payload "$history_json" "" "false")
     output_messages_json=$(jq -cn \
-        --argjson history "$history_json" \
-        --arg c "$output" \
+        --slurpfile history_f <(printf '%s\n' "$history_json") \
+        --rawfile c <(printf '%s' "$output") \
         --arg ts "$span_end" \
-        '$history + [{role: "assistant", timestamp_nanos: $ts, content: [{type: "text", text: $c}], text: $c}]')
+        '$history_f[0] + [{role: "assistant", timestamp_nanos: $ts, content: [{type: "text", text: $c}], text: $c}]')
     output_payload=$(_turn_context_payload "$output_messages_json" "$output" "true")
     input_json=$(echo "$input_payload" | jq -c '.' | _turn_json_string)
     output_json=$(echo "$output_payload" | jq -c '.' | _turn_json_string)
@@ -230,8 +230,8 @@ _turn_create_llm_span() {
 
     attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "llm" \
-        --argjson input "$input_json" \
-        --argjson output "$output_json" \
+        --slurpfile input_f <(printf '%s\n' "$input_json") \
+        --slurpfile output_f <(printf '%s\n' "$output_json") \
         --arg model "${model:-claude}" \
         --arg provider "$provider" \
         --argjson prompt "${prompt_tokens:-0}" \
@@ -241,7 +241,7 @@ _turn_create_llm_span() {
         --arg usage_meta "$usage_meta" \
         --arg session_id "$TURN_SESSION_ID" \
         --argjson turn_index "${TURN_INDEX:-1}" \
-        '{
+        '$input_f[0] as $input | $output_f[0] as $output | {
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
           "judgment.output": $output,
@@ -284,12 +284,12 @@ _turn_create_tool_span() {
     output_json=$(echo "$tool_output" | _turn_json_string)
     attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "tool" \
-        --argjson input "$input_json" \
-        --argjson output "$output_json" \
+        --slurpfile input_f <(printf '%s\n' "$input_json") \
+        --slurpfile output_f <(printf '%s\n' "$output_json") \
         --arg tool_name "$tool_name" \
         --arg session_id "$TURN_SESSION_ID" \
         --argjson turn_index "${TURN_INDEX:-1}" \
-        '{
+        '$input_f[0] as $input | $output_f[0] as $output | {
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
           "judgment.output": $output,
@@ -425,7 +425,7 @@ parse_turn_transcript() {
                     conversation_history=$(echo "$conversation_history" | jq \
                         --arg ts "$timestamp" \
                         --arg id "$tool_use_id" \
-                        --arg c "$tool_out" \
+                        --rawfile c <(printf '%s' "$tool_out") \
                         '. += [{role: "tool", timestamp: $ts, tool_use_id: $id, content: [{type: "tool_result", content: $c}], text: $c}]')
                 done < <(echo "$content" | jq -c '.[]' 2>/dev/null)
 
@@ -446,7 +446,7 @@ parse_turn_transcript() {
                 fi
                 text=$(_turn_extract_text_content "$content")
                 if [ -n "$text" ]; then
-                    conversation_history=$(echo "$conversation_history" | jq --arg ts "$timestamp" --arg c "$text" '. += [{role: "user", timestamp: $ts, content: [{type: "text", text: $c}], text: $c}]')
+                    conversation_history=$(echo "$conversation_history" | jq --arg ts "$timestamp" --rawfile c <(printf '%s' "$text") '. += [{role: "user", timestamp: $ts, content: [{type: "text", text: $c}], text: $c}]')
                     [ -z "$TURN_TASK_INPUT" ] && TURN_TASK_INPUT="$text"
                 fi
                 llm_start_time=$(iso_to_nanos "$timestamp")
@@ -473,10 +473,10 @@ parse_turn_transcript() {
                     tool_input=$(echo "$tool_use" | jq -c '.input // {}')
                     tool_start=$(iso_to_nanos "$timestamp")
                     if [ -n "$tool_id" ] && [ -n "$tool_name" ]; then
-                        pending_tools=$(echo "$pending_tools" | jq --arg id "$tool_id" --arg name "$tool_name" --arg input "$tool_input" --arg start "$tool_start" \
+                        pending_tools=$(echo "$pending_tools" | jq --arg id "$tool_id" --arg name "$tool_name" --rawfile input <(printf '%s' "$tool_input") --arg start "$tool_start" \
                             '.[$id] = {name: $name, input: $input, start: $start}')
-                        current_tool_uses=$(echo "$current_tool_uses" | jq --arg id "$tool_id" --arg name "$tool_name" --argjson input "$tool_input" \
-                            '. += [{type: "tool_use", id: $id, name: $name, input: $input}]')
+                        current_tool_uses=$(echo "$current_tool_uses" | jq --arg id "$tool_id" --arg name "$tool_name" --slurpfile input_f <(printf '%s\n' "$tool_input") \
+                            '$input_f[0] as $input | . += [{type: "tool_use", id: $id, name: $name, input: $input}]')
                     fi
                 done < <(echo "$line" | jq -c '.message.content[] | select(.type == "tool_use")' 2>/dev/null)
             fi
@@ -530,13 +530,13 @@ finalize_turn_trace() {
 
     task_attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "task" \
-        --argjson input "$task_input_json" \
-        --argjson output "$task_output_json" \
+        --slurpfile input_f <(printf '%s\n' "$task_input_json") \
+        --slurpfile output_f <(printf '%s\n' "$task_output_json") \
         --argjson llm "$TURN_LLM_CALLS" \
         --argjson tools "$TURN_TOOL_CALLS" \
         --arg session_id "$TURN_SESSION_ID" \
         --argjson turn_index "${TURN_INDEX:-1}" \
-        '{
+        '$input_f[0] as $input | $output_f[0] as $output | {
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
           "judgment.output": $output,
@@ -552,15 +552,15 @@ finalize_turn_trace() {
 
     root_attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "task" \
-        --argjson input "$task_input_json" \
-        --argjson output "$task_output_json" \
+        --slurpfile input_f <(printf '%s\n' "$task_input_json") \
+        --slurpfile output_f <(printf '%s\n' "$task_output_json") \
         --arg session_id "$TURN_SESSION_ID" \
         --arg workspace "${TURN_WORKSPACE:-}" \
         --arg hostname "$(get_hostname)" \
         --arg username "$(get_username)" \
         --arg os "$(get_os)" \
         --argjson turn_index "${TURN_INDEX:-1}" \
-        '{
+        '$input_f[0] as $input | $output_f[0] as $output | {
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
           "judgment.output": $output,

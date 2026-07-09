@@ -132,13 +132,13 @@ extend_parent_turn_spans() {
 
     task_attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "task" \
-        --argjson input "$MAPPED_PARENT_TASK_INPUT_JSON" \
-        --argjson output "$MAPPED_PARENT_TASK_OUTPUT_JSON" \
+        --slurpfile input_f <(printf '%s\n' "$MAPPED_PARENT_TASK_INPUT_JSON") \
+        --slurpfile output_f <(printf '%s\n' "$MAPPED_PARENT_TASK_OUTPUT_JSON") \
         --argjson llm "${MAPPED_PARENT_LLM_CALLS:-0}" \
         --argjson tools "${MAPPED_PARENT_TOOL_CALLS:-0}" \
         --arg session_id "$PARENT_SESSION_ID" \
         --argjson turn_index "${TURN_INDEX:-1}" \
-        '{
+        '$input_f[0] as $input | $output_f[0] as $output | {
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
           "judgment.output": $output,
@@ -154,15 +154,15 @@ extend_parent_turn_spans() {
 
     root_attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "task" \
-        --argjson input "$MAPPED_PARENT_TASK_INPUT_JSON" \
-        --argjson output "$MAPPED_PARENT_TASK_OUTPUT_JSON" \
+        --slurpfile input_f <(printf '%s\n' "$MAPPED_PARENT_TASK_INPUT_JSON") \
+        --slurpfile output_f <(printf '%s\n' "$MAPPED_PARENT_TASK_OUTPUT_JSON") \
         --arg session_id "$PARENT_SESSION_ID" \
         --arg workspace "${MAPPED_PARENT_WORKSPACE:-}" \
         --arg hostname "${MAPPED_PARENT_HOSTNAME:-$(get_hostname)}" \
         --arg username "${MAPPED_PARENT_USERNAME:-$(get_username)}" \
         --arg os "${MAPPED_PARENT_OS:-$(get_os)}" \
         --argjson turn_index "${TURN_INDEX:-1}" \
-        '{
+        '$input_f[0] as $input | $output_f[0] as $output | {
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
           "judgment.output": $output,
@@ -243,7 +243,7 @@ subagent_history_for_llm() {
     if echo "$history" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
         echo "$history"
     elif [ -n "${TASK_DESCRIPTION:-}" ]; then
-        jq -cn --arg d "$TASK_DESCRIPTION" '[{role: "user", content: [{type: "text", text: $d}], text: $d}]'
+        jq -cn --rawfile d <(printf '%s' "$TASK_DESCRIPTION") '[{role: "user", content: [{type: "text", text: $d}], text: $d}]'
     else
         echo "[]"
     fi
@@ -261,10 +261,10 @@ subagent_extract_text_content() {
 subagent_append_assistant_history() {
     local history="$1" text="$2" tool_uses="$3" timestamp="$4"
     if echo "$tool_uses" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
-        echo "$history" | jq --arg ts "$timestamp" --arg c "$text" --argjson tools "$tool_uses" \
-            '. += [{role: "assistant", timestamp: $ts, content: $tools, text: $c, tool_uses: $tools}]'
+        echo "$history" | jq --arg ts "$timestamp" --rawfile c <(printf '%s' "$text") --slurpfile tools_f <(printf '%s\n' "$tool_uses") \
+            '$tools_f[0] as $tools | . += [{role: "assistant", timestamp: $ts, content: $tools, text: $c, tool_uses: $tools}]'
     elif [ -n "$text" ]; then
-        echo "$history" | jq --arg ts "$timestamp" --arg c "$text" \
+        echo "$history" | jq --arg ts "$timestamp" --rawfile c <(printf '%s' "$text") \
             '. += [{role: "assistant", timestamp: $ts, content: [{type: "text", text: $c}], text: $c}]'
     else
         echo "$history"
@@ -308,10 +308,10 @@ subagent_tool_output_from_result() {
         history_json=$(subagent_history_for_llm "$history")
         input_json=$(echo "$history_json" | jq -c '.' | jq -Rs '.')
         output_messages_json=$(jq -cn \
-            --argjson history "$history_json" \
-            --arg c "$output" \
+            --slurpfile history_f <(printf '%s\n' "$history_json") \
+            --rawfile c <(printf '%s' "$output") \
             --arg ts "${end_time:-}" \
-            '$history + [{role: "assistant", timestamp_nanos: $ts, content: [{type: "text", text: $c}], text: $c}]')
+            '$history_f[0] + [{role: "assistant", timestamp_nanos: $ts, content: [{type: "text", text: $c}], text: $c}]')
         output_json=$(echo "$output_messages_json" | jq -c '.' | jq -Rs '.')
         usage_meta=$(jq -n \
             --argjson inp "${prompt:-0}" \
@@ -321,14 +321,16 @@ subagent_tool_output_from_result() {
             '{input_tokens: $inp, output_tokens: $out, cache_creation_input_tokens: $cc, cache_read_input_tokens: $cr}' | jq -c '.')
         
         attrs=$(build_otlp_attributes "$(jq -n \
-            --arg span_kind "llm" --argjson input "$input_json" --argjson output "$output_json" \
+            --arg span_kind "llm" \
+            --slurpfile input_f <(printf '%s\n' "$input_json") \
+            --slurpfile output_f <(printf '%s\n' "$output_json") \
             --arg model "${model:-claude}" --arg provider "$provider" \
             --argjson prompt "$prompt" --argjson completion "$completion" \
             --argjson cache_create "${cache_create:-0}" --argjson cache_read "${cache_read:-0}" \
             --arg usage_meta "$usage_meta" \
             --arg session_id "$PARENT_SESSION_ID" \
             --argjson turn_index "${TURN_INDEX:-1}" \
-            '{
+            '$input_f[0] as $input | $output_f[0] as $output | {
               "judgment.span_kind": $span_kind,
               "judgment.input": $input,
               "judgment.output": $output,
@@ -362,8 +364,8 @@ subagent_tool_output_from_result() {
         input_json=$(echo "$tool_input" | jq -c '.' 2>/dev/null | jq -Rs '.')
         output_json=$(echo "$tool_output" | jq -Rs '.')
         
-        attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" --arg subagent_id "$SUBAGENT_ID" --arg session_id "$PARENT_SESSION_ID" --argjson turn_index "${TURN_INDEX:-1}" \
-            '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "subagent_id": $subagent_id, "judgment.session_id": $session_id, "session_id": $session_id, "turn_index": $turn_index}')")
+        attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --slurpfile input_f <(printf '%s\n' "$input_json") --slurpfile output_f <(printf '%s\n' "$output_json") --arg tool_name "$tool_name" --arg subagent_id "$SUBAGENT_ID" --arg session_id "$PARENT_SESSION_ID" --argjson turn_index "${TURN_INDEX:-1}" \
+            '$input_f[0] as $input | $output_f[0] as $output | {"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "subagent_id": $subagent_id, "judgment.session_id": $session_id, "session_id": $session_id, "turn_index": $turn_index}')")
         
         span=$(build_otlp_span "$TRACE_ID" "$span_id" "$SUBAGENT_SPAN_ID" "$tool_name" "tool" "$start_time" "$end_time" "$attrs" 20)
         
@@ -431,7 +433,7 @@ subagent_tool_output_from_result() {
                     CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq \
                         --arg ts "$TIMESTAMP" \
                         --arg id "$TOOL_USE_ID" \
-                        --arg c "$TOOL_OUT" \
+                        --rawfile c <(printf '%s' "$TOOL_OUT") \
                         '. += [{role: "tool", timestamp: $ts, tool_use_id: $id, content: [{type: "tool_result", content: $c}], text: $c}]')
                 done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null)
                 
@@ -445,7 +447,7 @@ subagent_tool_output_from_result() {
                 fi
                 TEXT=$(subagent_extract_text_content "$CONTENT")
                 if [ -n "$TEXT" ]; then
-                    CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg ts "$TIMESTAMP" --arg c "$TEXT" \
+                    CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg ts "$TIMESTAMP" --rawfile c <(printf '%s' "$TEXT") \
                         '. += [{role: "user", timestamp: $ts, content: [{type: "text", text: $c}], text: $c}]')
                 fi
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
@@ -463,10 +465,10 @@ subagent_tool_output_from_result() {
                     TOOL_NAME=$(echo "$TOOL_USE" | jq -r '.name // empty')
                     TOOL_INPUT=$(echo "$TOOL_USE" | jq -c '.input // {}')
                     if [ -n "$TOOL_ID" ] && [ -n "$TOOL_NAME" ]; then
-                        PENDING_TOOLS=$(echo "$PENDING_TOOLS" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --arg input "$TOOL_INPUT" --arg start "$(iso_to_nanos "$TIMESTAMP")" \
+                        PENDING_TOOLS=$(echo "$PENDING_TOOLS" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --rawfile input <(printf '%s' "$TOOL_INPUT") --arg start "$(iso_to_nanos "$TIMESTAMP")" \
                             '.[$id] = {name: $name, input: $input, start: $start}')
-                        CURRENT_TOOL_USES=$(echo "$CURRENT_TOOL_USES" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --argjson input "$TOOL_INPUT" \
-                            '. += [{type: "tool_use", id: $id, name: $name, input: $input}]')
+                        CURRENT_TOOL_USES=$(echo "$CURRENT_TOOL_USES" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --slurpfile input_f <(printf '%s\n' "$TOOL_INPUT") \
+                            '$input_f[0] as $input | . += [{type: "tool_use", id: $id, name: $name, input: $input}]')
                     fi
                 done < <(echo "$line" | jq -c '.message.content[] | select(.type == "tool_use")' 2>/dev/null)
             fi
@@ -522,14 +524,14 @@ SUBAGENT_OUTPUT_JSON=$(echo "${SUBAGENT_OUTPUT:-Completed}" | jq -Rs '.')
 
 SUBAGENT_ATTRS=$(build_otlp_attributes "$(jq -n \
     --arg span_kind "task" \
-    --argjson input "$TASK_INPUT_JSON" \
-    --argjson output "$SUBAGENT_OUTPUT_JSON" \
+    --slurpfile input_f <(printf '%s\n' "$TASK_INPUT_JSON") \
+    --slurpfile output_f <(printf '%s\n' "$SUBAGENT_OUTPUT_JSON") \
     --arg subagent_id "${SUBAGENT_ID:-unknown}" \
     --argjson llm_calls "$LLM_CALLS" \
     --argjson tool_calls "$TOOL_CALLS" \
     --arg session_id "$PARENT_SESSION_ID" \
     --argjson turn_index "${TURN_INDEX:-1}" \
-    '{
+    '$input_f[0] as $input | $output_f[0] as $output | {
         "judgment.span_kind": $span_kind,
         "judgment.input": $input,
         "judgment.output": $output,

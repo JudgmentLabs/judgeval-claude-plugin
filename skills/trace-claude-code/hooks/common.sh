@@ -111,7 +111,9 @@ set_state_value() {
 _set_state_value_unsafe() {
     local state
     state=$(load_state)
-    save_state "$(echo "$state" | jq --arg k "$1" --arg v "$2" '.[$k] = $v')"
+    # Large values (prompts, serialized histories) must never be passed as
+    # jq/curl argv (ARG_MAX); feed them through /dev/fd instead.
+    save_state "$(echo "$state" | jq --arg k "$1" --rawfile v <(printf '%s' "$2") '.[$k] = $v')"
 }
 
 get_session_state() {
@@ -132,7 +134,7 @@ set_session_state() {
 _set_session_state_unsafe() {
     local state
     state=$(load_state)
-    save_state "$(echo "$state" | jq --arg s "$1" --arg k "$2" --arg v "$3" \
+    save_state "$(echo "$state" | jq --arg s "$1" --arg k "$2" --rawfile v <(printf '%s' "$3") \
         '.sessions[$s] = (.sessions[$s] // {}) | .sessions[$s][$k] = $v')"
 }
 
@@ -150,7 +152,7 @@ _set_session_state_batch_unsafe() {
     while [ $# -ge 2 ]; do
         key="$1"
         val="$2"
-        state=$(echo "$state" | jq --arg s "$session_id" --arg k "$key" --arg v "$val" \
+        state=$(echo "$state" | jq --arg s "$session_id" --arg k "$key" --rawfile v <(printf '%s' "$val") \
             '.sessions[$s] = (.sessions[$s] // {}) | .sessions[$s][$k] = $v')
         shift 2
     done
@@ -173,7 +175,7 @@ _clear_session_keys_unsafe() {
 # API Operations
 _build_otlp_payload() {
     local span_json="$1"
-    jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
+    jq -n --arg service_name "$PROJECT" --slurpfile span_f <(printf '%s\n' "$span_json") '$span_f[0] as $span | {
         resourceSpans: [{
             resource: { attributes: [
                 { key: "service.name", value: { stringValue: $service_name } },
@@ -193,7 +195,7 @@ insert_span() {
     
     otlp_payload=$(_build_otlp_payload "$span_json")
     
-    resp=$(curl -s -w "\n%{http_code}" \
+    resp=$(printf '%s' "$otlp_payload" | curl -s -w "\n%{http_code}" \
         --max-time 5 \
         --connect-timeout 3 \
         -X POST \
@@ -201,7 +203,7 @@ insert_span() {
         -H "X-Organization-Id: $ORG_ID" \
         -H "X-Project-Id: $project_id" \
         -H "Content-Type: application/json" \
-        -d "$otlp_payload" \
+        --data-binary @- \
         "$API_URL/otel/v1/traces" 2>&1)
     
     http_code=$(echo "$resp" | tail -1)
@@ -323,8 +325,8 @@ build_otlp_span() {
         --arg name "$name" \
         --arg start_time "$start_time" \
         --arg end_time "$end_time" \
-        --argjson attributes "$attrs_with_update" \
-        '{
+        --slurpfile attributes_f <(printf '%s\n' "$attrs_with_update") \
+        '$attributes_f[0] as $attributes | {
             traceId: $trace_id,
             spanId: $span_id,
             parentSpanId: (if $parent_span_id == "" then null else $parent_span_id end),

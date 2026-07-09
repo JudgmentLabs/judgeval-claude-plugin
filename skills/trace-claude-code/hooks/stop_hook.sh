@@ -53,7 +53,7 @@ attach_task_notification_followup() {
     transcript_path=$(find_transcript_path "$SESSION_ID" "$TRANSCRIPT_PATH" || true)
     relay_record=""
     if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-        relay_record=$(jq -c --arg out "$LAST_ASSISTANT" '
+        relay_record=$(jq -c --rawfile out <(printf '%s' "$LAST_ASSISTANT") '
             select(.type == "assistant")
             | ([.message.content[]? | select(.type == "text") | .text] | join("\n")) as $text
             | select($text == $out)
@@ -100,8 +100,8 @@ attach_task_notification_followup() {
 
     local input_payload output_payload input_json output_json span_id attrs span update_id provider messages_json
     messages_json=$(jq -cn \
-        --arg notification "${notification:-Task notification}" \
-        --arg response "$LAST_ASSISTANT" \
+        --rawfile notification <(printf '%s' "${notification:-Task notification}") \
+        --rawfile response <(printf '%s' "$LAST_ASSISTANT") \
         --arg end "$relay_end" \
         '[
           {role: "user", content: [{type: "text", text: $notification}], text: $notification},
@@ -114,7 +114,7 @@ attach_task_notification_followup() {
         --arg task_span_id "$task_span_id" \
         --argjson turn_index "${turn_index:-1}" \
         --arg workspace "${parent_workspace:-}" \
-        --arg notification "${notification:-Task notification}" \
+        --rawfile notification <(printf '%s' "${notification:-Task notification}") \
         '{
           metadata: {
             session_id: $session_id,
@@ -128,8 +128,8 @@ attach_task_notification_followup() {
           current_user_prompt: "task-notification",
           messages: [{role: "user", content: [{type: "text", text: $notification}], text: $notification}]
         }')
-    output_payload=$(echo "$input_payload" | jq --argjson messages "$messages_json" --arg response "$LAST_ASSISTANT" \
-        '.messages = $messages | .assistant_output = $response')
+    output_payload=$(echo "$input_payload" | jq --slurpfile messages_f <(printf '%s\n' "$messages_json") --rawfile response <(printf '%s' "$LAST_ASSISTANT") \
+        '.messages = $messages_f[0] | .assistant_output = $response')
     input_json=$(echo "$input_payload" | jq -c '.' | jq -Rs '.')
     output_json=$(echo "$output_payload" | jq -c '.' | jq -Rs '.')
     provider=$(detect_provider "$model")
@@ -138,8 +138,8 @@ attach_task_notification_followup() {
 
     attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "llm" \
-        --argjson input "$input_json" \
-        --argjson output "$output_json" \
+        --slurpfile input_f <(printf '%s\n' "$input_json") \
+        --slurpfile output_f <(printf '%s\n' "$output_json") \
         --arg model "$model" \
         --arg provider "$provider" \
         --argjson prompt "${inp:-0}" \
@@ -149,7 +149,7 @@ attach_task_notification_followup() {
         --arg usage_meta "$usage_meta" \
         --arg session_id "$parent_session" \
         --argjson turn_index "${turn_index:-1}" \
-        '{
+        '$input_f[0] as $input | $output_f[0] as $output | {
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
           "judgment.output": $output,
@@ -173,7 +173,7 @@ attach_task_notification_followup() {
        echo "$parent_input_json" | jq -e 'type == "string"' >/dev/null 2>&1 &&
        echo "$parent_output_json" | jq -e 'type == "string"' >/dev/null 2>&1; then
         local updated_output_json updated_llm_calls parent_end parent_task_attrs parent_task_span parent_root_attrs parent_root_span root_name
-        updated_output_json=$(echo "$parent_output_json" | jq -r '.' 2>/dev/null | jq -c --arg response "$LAST_ASSISTANT" --arg end "$relay_end" \
+        updated_output_json=$(echo "$parent_output_json" | jq -r '.' 2>/dev/null | jq -c --rawfile response <(printf '%s' "$LAST_ASSISTANT") --arg end "$relay_end" \
             '.messages += [{role: "assistant", timestamp_nanos: $end, content: [{type: "text", text: $response}], text: $response}]
              | .assistant_output = $response' 2>/dev/null | jq -Rs 'rtrimstr("\n")')
         if [ -z "$updated_output_json" ]; then
@@ -184,13 +184,13 @@ attach_task_notification_followup() {
 
         parent_task_attrs=$(build_otlp_attributes "$(jq -n \
             --arg span_kind "task" \
-            --argjson input "$parent_input_json" \
-            --argjson output "$updated_output_json" \
+            --slurpfile input_f <(printf '%s\n' "$parent_input_json") \
+            --slurpfile output_f <(printf '%s\n' "$updated_output_json") \
             --argjson llm "$updated_llm_calls" \
             --argjson tools "${parent_tool_calls:-0}" \
             --arg session_id "$parent_session" \
             --argjson turn_index "${turn_index:-1}" \
-            '{
+            '$input_f[0] as $input | $output_f[0] as $output | {
               "judgment.span_kind": $span_kind,
               "judgment.input": $input,
               "judgment.output": $output,
@@ -206,15 +206,15 @@ attach_task_notification_followup() {
 
         parent_root_attrs=$(build_otlp_attributes "$(jq -n \
             --arg span_kind "task" \
-            --argjson input "$parent_input_json" \
-            --argjson output "$updated_output_json" \
+            --slurpfile input_f <(printf '%s\n' "$parent_input_json") \
+            --slurpfile output_f <(printf '%s\n' "$updated_output_json") \
             --arg session_id "$parent_session" \
             --arg workspace "${parent_workspace:-}" \
             --arg hostname "${parent_hostname:-$(get_hostname)}" \
             --arg username "${parent_username:-$(get_username)}" \
             --arg os "${parent_os:-$(get_os)}" \
             --argjson turn_index "${turn_index:-1}" \
-            '{
+            '$input_f[0] as $input | $output_f[0] as $output | {
               "judgment.span_kind": $span_kind,
               "judgment.input": $input,
               "judgment.output": $output,

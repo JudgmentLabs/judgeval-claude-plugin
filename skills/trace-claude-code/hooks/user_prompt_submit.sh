@@ -67,23 +67,23 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
             --arg task_id "$TASK_NOTIFICATION_ID" \
             --arg background_session_id "$SESSION_ID" \
             --arg description "${DESCRIPTION:-Subagent task}" \
-            --arg notification "$PROMPT" \
+            --rawfile notification <(printf '%s' "$PROMPT") \
             '{task_id: $task_id, background_session_id: $background_session_id, description: $description, notification: $notification}' | jq -c '.' | jq -Rs '.')
         OUTPUT_JSON=$(jq -cn \
             --arg status "${TASK_STATUS:-completed}" \
             --arg summary "$TASK_SUMMARY" \
             --arg output_file "$OUTPUT_FILE" \
-            --arg result "$TASK_RESULT" \
+            --rawfile result <(printf '%s' "$TASK_RESULT") \
             '{status: $status, summary: $summary, output_file: $output_file, result: $result}' | jq -c '.' | jq -Rs '.')
         ATTRS=$(build_otlp_attributes "$(jq -n \
             --arg span_kind "task" \
-            --argjson input "$INPUT_JSON" \
-            --argjson output "$OUTPUT_JSON" \
+            --slurpfile input_f <(printf '%s\n' "$INPUT_JSON") \
+            --slurpfile output_f <(printf '%s\n' "$OUTPUT_JSON") \
             --arg task_id "$TASK_NOTIFICATION_ID" \
             --arg background_session_id "$SESSION_ID" \
             --arg session_id "$PARENT_SESSION_ID" \
             --argjson turn_index "${TURN_INDEX:-1}" \
-            '{
+            '$input_f[0] as $input | $output_f[0] as $output | {
               "judgment.span_kind": $span_kind,
               "judgment.input": $input,
               "judgment.output": $output,
@@ -114,13 +114,13 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
 
                 PARENT_TASK_ATTRS=$(build_otlp_attributes "$(jq -n \
                     --arg span_kind "task" \
-                    --argjson input "$PARENT_TASK_INPUT_JSON" \
-                    --argjson output "$PARENT_TASK_OUTPUT_JSON" \
+                    --slurpfile input_f <(printf '%s\n' "$PARENT_TASK_INPUT_JSON") \
+                    --slurpfile output_f <(printf '%s\n' "$PARENT_TASK_OUTPUT_JSON") \
                     --argjson llm "${PARENT_LLM_CALLS:-0}" \
                     --argjson tools "${PARENT_TOOL_CALLS:-0}" \
                     --arg session_id "$PARENT_SESSION_ID" \
                     --argjson turn_index "${TURN_INDEX:-1}" \
-                    '{
+                    '$input_f[0] as $input | $output_f[0] as $output | {
                       "judgment.span_kind": $span_kind,
                       "judgment.input": $input,
                       "judgment.output": $output,
@@ -136,15 +136,15 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
 
                 PARENT_ROOT_ATTRS=$(build_otlp_attributes "$(jq -n \
                     --arg span_kind "task" \
-                    --argjson input "$PARENT_TASK_INPUT_JSON" \
-                    --argjson output "$PARENT_TASK_OUTPUT_JSON" \
+                    --slurpfile input_f <(printf '%s\n' "$PARENT_TASK_INPUT_JSON") \
+                    --slurpfile output_f <(printf '%s\n' "$PARENT_TASK_OUTPUT_JSON") \
                     --arg session_id "$PARENT_SESSION_ID" \
                     --arg workspace "${PARENT_WORKSPACE:-}" \
                     --arg hostname "${PARENT_HOSTNAME:-$(get_hostname)}" \
                     --arg username "${PARENT_USERNAME:-$(get_username)}" \
                     --arg os "${PARENT_OS:-$(get_os)}" \
                     --argjson turn_index "${TURN_INDEX:-1}" \
-                    '{
+                    '$input_f[0] as $input | $output_f[0] as $output | {
                       "judgment.span_kind": $span_kind,
                       "judgment.input": $input,
                       "judgment.output": $output,
@@ -217,14 +217,14 @@ PROMPT_JSON=$(echo "$PROMPT" | jq -Rs '.')
 
 ROOT_ATTRS=$(build_otlp_attributes "$(jq -n \
     --arg span_kind "task" \
-    --argjson input "$PROMPT_JSON" \
+    --slurpfile input_f <(printf '%s\n' "$PROMPT_JSON") \
     --arg session_id "$SESSION_ID" \
     --arg workspace "$WORKSPACE" \
     --arg hostname "$(get_hostname)" \
     --arg username "$(get_username)" \
     --arg os "$(get_os)" \
     --argjson turn_index "$TURN_INDEX" \
-    '{
+    '$input_f[0] as $input | {
         "judgment.span_kind": $span_kind,
         "judgment.input": $input,
         "judgment.output": "",
@@ -243,10 +243,10 @@ insert_span_sync "$PROJECT_ID" "$ROOT_SPAN" >/dev/null || { log "ERROR" "Failed 
 
 TASK_ATTRS=$(build_otlp_attributes "$(jq -n \
     --arg span_kind "task" \
-    --argjson input "$PROMPT_JSON" \
+    --slurpfile input_f <(printf '%s\n' "$PROMPT_JSON") \
     --arg session_id "$SESSION_ID" \
     --argjson turn_index "$TURN_INDEX" \
-    '{
+    '$input_f[0] as $input | {
         "judgment.span_kind": $span_kind,
         "judgment.input": $input,
         "judgment.output": "",
