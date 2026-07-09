@@ -62,13 +62,20 @@ attach_task_notification_followup() {
 
     request_id=$(echo "$relay_record" | jq -r '.requestId // empty' 2>/dev/null)
     request_end_iso=$(echo "$relay_record" | jq -r '.timestamp // empty' 2>/dev/null)
-    request_start_iso="$request_end_iso"
+    request_start_iso=""
     if [ -n "$request_id" ] && [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-        request_start_iso=$(jq -r --arg req "$request_id" '
-            select((.requestId // "") == $req and ((.timestamp // "") | length > 0))
-            | .timestamp
-        ' "$transcript_path" 2>/dev/null | head -1)
+        # Match parse_turn_transcript: the LLM call starts at the record that
+        # precedes the first record of this request (the notification prompt),
+        # not at the request's own first record — a single-record response
+        # would otherwise collapse to a zero-duration span.
+        request_start_iso=$(jq -rs --arg req "$request_id" '
+            (map(.requestId // "") | index($req)) as $i
+            | if $i == null or $i == 0 then empty
+              else (.[0:$i] | map(.timestamp // empty | select(length > 0)) | last) // empty
+              end
+        ' "$transcript_path" 2>/dev/null)
     fi
+    [ -z "$request_start_iso" ] && request_start_iso="$request_end_iso"
 
     relay_end=$(iso_to_nanos "$request_end_iso")
     relay_start=$(iso_to_nanos "$request_start_iso")
