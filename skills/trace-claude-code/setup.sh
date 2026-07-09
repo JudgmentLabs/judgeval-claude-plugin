@@ -153,7 +153,6 @@ HOOKS_CONFIG=$(cat <<EOF
             ]
         }
     ],
-            ],
     "Stop": [
         {
             "hooks": [
