@@ -28,6 +28,17 @@ tracing_enabled() {
     [ "$(echo "$TRACE_TO_JUDGEVAL" | tr '[:upper:]' '[:lower:]')" = "true" ]
 }
 
+# A tracing hook must be invisible to the session it traces: Claude Code
+# feeds a hook's stderr and non-zero exit back into the conversation as
+# "hook feedback", so a crashing hook can derail the user's session (a
+# crashed Stop hook's error output caused live sessions to start debugging
+# these very scripts). Route stderr to the log and convert any set -e
+# failure into a logged clean exit.
+hook_guard() {
+    exec 2>>"$LOG_FILE"
+    trap 'log ERROR "Hook crashed: ${BASH_SOURCE[1]##*/} line ${BASH_LINENO[0]}"; exit 0' ERR
+}
+
 check_requirements() {
     for cmd in jq curl; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -319,16 +330,15 @@ workspace_display_name() {
     echo "$n"
 }
 
-# build_root_span_attrs SESSION_ID WORKSPACE [OUTPUT] [EXTRA_JSON]
-# Single builder for the session root span's attributes, used at creation
-# (ensure_trace) and finalization (session_end) so the finalize update can
-# never silently drop an attribute added at creation. EXTRA_JSON is a jq
-# object merged in (e.g. cross-trace link attributes).
+# build_root_span_attrs SESSION_ID WORKSPACE INPUT [OUTPUT] [EXTRA_JSON]
+# Attributes for a turn-trace root span, used at creation (create_turn_trace)
+# and finalization (finalize_turn_root) so the finalize update can never
+# silently drop an attribute added at creation.
 build_root_span_attrs() {
-    local session_id="$1" workspace="$2" output="$3" extra="$4"
+    local session_id="$1" workspace="$2" input="$3" output="$4" extra="$5"
     [ -z "$extra" ] && extra="{}"
     build_otlp_attributes "$(jq -n \
-        --arg input "Session: $(workspace_display_name "$workspace")" \
+        --arg input "$input" \
         --arg output "$output" \
         --arg session_id "$session_id" \
         --arg workspace "${workspace:-}" \
@@ -347,6 +357,7 @@ build_root_span_attrs() {
             "source": "claude-code"
         } + (if $output == "" then {} else {"judgment.output": $output} end) + $extra')"
 }
+
 
 # Cross-trace linkage for resumed sessions.
 #
@@ -397,62 +408,79 @@ previous_trace_link_attrs() {
 # The transcript may already contain lines when the trace is created (a
 # resumed session, or a mid-session plugin install): those lines belong to
 # earlier traces or to the untraced past, so parsing starts after them.
-ensure_trace() {
-    local session_id="$1" workspace="$2" transcript_path="$3"
-    TRACE_ID=$(get_session_state "$session_id" "trace_id")
-    [ -n "$TRACE_ID" ] && return 0
-
-    local initial_offset=0
-    if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-        initial_offset=$(awk 'END{print NR}' "$transcript_path" 2>/dev/null || echo 0)
-        [ "$initial_offset" -gt 0 ] 2>/dev/null || initial_offset=0
-        [ "$initial_offset" -gt 0 ] && debug "Trace starts at transcript line $initial_offset"
+# create_turn_trace SESSION_ID WORKSPACE PROMPT PROMPT_ID [TRANSCRIPT_PATH]
+# One trace per user turn: the root span IS the turn. Idempotent per
+# prompt id; reserve-then-post under the lock (concurrent hooks cannot
+# mint duplicate turn roots). Sets TRACE_ID and ROOT_SPAN_ID.
+create_turn_trace() {
+    local session_id="$1" workspace="$2" prompt="$3" prompt_id="$4" transcript_path="$5"
+    local cur_tid cur_pid
+    IFS=$'\x1f' read -r cur_tid cur_pid <<< "$(get_session_fields "$session_id" trace_id current_prompt_id)"
+    if [ -n "$cur_tid" ] && [ -n "$prompt_id" ] && [ "$cur_pid" = "$prompt_id" ]; then
+        TRACE_ID="$cur_tid"
+        ROOT_SPAN_ID=$(get_session_state "$session_id" "root_span_id")
+        return 0
     fi
 
-    local project_id trace_id span_id start_time attrs span
+    local project_id trace_id span_id start_time attrs span link_attrs initial_offset
     project_id=$(get_project_id "$PROJECT") || { log "ERROR" "Failed to get project"; return 1; }
+
+    # First turn of a session (or after resume): start parsing near the end
+    # of the transcript. promptId filtering makes over-reading safe; this
+    # just avoids re-reading a long restored transcript every turn.
+    initial_offset=""
+    if [ -z "$(get_session_state "$session_id" "transcript_offset")" ]; then
+        initial_offset=0
+        if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+            local lines
+            lines=$(awk 'END{print NR}' "$transcript_path" 2>/dev/null || echo 0)
+            [ "$lines" -ge 5 ] 2>/dev/null && initial_offset=$((lines - 5))
+        fi
+    fi
 
     trace_id=$(generate_uuid | sed 's/-//g' | head -c 32)
     while [ ${#trace_id} -lt 32 ]; do trace_id="${trace_id}0"; done
     span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
     start_time=$(get_time_nanos)
 
-    # Claim trace creation atomically: SessionStart and UserPromptSubmit can
-    # race for the same session (back-to-back in -p mode); without the lock
-    # both mint roots and one clobbers the other's state. The network post
-    # happens OUTSIDE the lock — if the loser's post never happens, nothing
-    # is lost, and if the winner's root post fails, SessionEnd re-posts the
-    # root span with the same id.
-    if ! with_lock _reserve_trace_unsafe "$session_id" "$trace_id" "$span_id" "$project_id" "$start_time" "$initial_offset" "$workspace"; then
+    if ! with_lock _reserve_turn_unsafe "$session_id" "$trace_id" "$span_id" "$project_id" "$start_time" "$prompt" "$prompt_id" "$workspace" "$initial_offset"; then
         TRACE_ID=$(get_session_state "$session_id" "trace_id")
-        [ -n "$TRACE_ID" ] && { debug "Trace already created by concurrent hook"; return 0; }
-        log "ERROR" "Could not reserve trace for session $session_id"
+        ROOT_SPAN_ID=$(get_session_state "$session_id" "root_span_id")
+        [ -n "$TRACE_ID" ] && { debug "Turn already created by concurrent hook"; return 0; }
+        log "ERROR" "Could not reserve turn trace for session $session_id"
         return 1
     fi
 
-    local link_attrs
     link_attrs=$(previous_trace_link_attrs "$session_id")
-    attrs=$(build_root_span_attrs "$session_id" "$workspace" "" "$link_attrs")
+    attrs=$(build_root_span_attrs "$session_id" "$workspace" "$prompt" "" "$link_attrs")
     span=$(build_otlp_span "$trace_id" "$span_id" "" "Claude Code: $(workspace_display_name "$workspace")" "task" "$start_time" "$start_time" "$attrs" 0)
-    insert_span_sync "$project_id" "$span" >/dev/null || log "ERROR" "Root span post failed (will re-post at session end)"
+    insert_span_sync "$project_id" "$span" >/dev/null || log "ERROR" "Turn root post failed (re-posted at turn finalize)"
 
     TRACE_ID="$trace_id"
-    log "INFO" "Created trace: $trace_id (session=$session_id)"
+    ROOT_SPAN_ID="$span_id"
+    log "INFO" "Turn trace created: $trace_id (session=$session_id)"
     return 0
 }
 
-# Returns 1 if this session already has a trace (caller lost the race).
-_reserve_trace_unsafe() {
-    local sid="$1" tid="$2" rid="$3" pid="$4" st="$5" off="$6" ws="$7"
-    local state existing
+# Returns 1 if another hook already reserved a turn for this prompt.
+_reserve_turn_unsafe() {
+    local sid="$1" tid="$2" rid="$3" pid="$4" st="$5" prompt="$6" prompt_id="$7" ws="$8" off="$9"
+    local state existing_pid existing_tid
     state=$(load_state)
-    existing=$(echo "$state" | jq -r --arg s "$sid" '.sessions[$s].trace_id // empty')
-    [ -n "$existing" ] && return 1
+    IFS=$'\x1f' read -r existing_tid existing_pid <<< "$(echo "$state" | jq -r --arg s "$sid" \
+        '(.sessions[$s] // {}) | [(.trace_id // ""), (.current_prompt_id // "")] | join("\u001f")')"
+    if [ -n "$existing_tid" ] && [ -n "$prompt_id" ] && [ "$existing_pid" = "$prompt_id" ]; then
+        return 1
+    fi
     save_state "$(echo "$state" | jq --arg s "$sid" --arg tid "$tid" --arg rid "$rid" \
-        --arg pid "$pid" --arg st "$st" --arg off "$off" --arg ws "$ws" \
+        --arg pid "$pid" --arg st "$st" --arg prompt "$prompt" --arg prompt_id "$prompt_id" \
+        --arg ws "$ws" --arg off "$off" \
         '.sessions[$s] = (.sessions[$s] // {}) + {trace_id: $tid, root_span_id: $rid,
-          project_id: $pid, started: $st, transcript_offset: $off, workspace: $ws}')"
+          project_id: $pid, turn_started: $st, current_turn_input: $prompt,
+          current_prompt_id: $prompt_id, workspace: $ws}
+         | if $off != "" then .sessions[$s].transcript_offset = $off else . end')"
 }
+
 
 
 

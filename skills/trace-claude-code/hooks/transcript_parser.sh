@@ -35,6 +35,9 @@
 #   PARSE_SESSION_ID         session id stamped on created spans
 #   PARSE_HISTORY_FILE       optional path persisting conversation history
 #                            across turns (empty = start fresh)
+#   PARSE_PROMPT_ID          optional turn prompt id: rows carrying a
+#                            different promptId are skipped (transcript
+#                            lines are not strictly ordered across turns)
 #   PARSE_EXTRA_ATTRS        optional jq object merged into llm/tool span
 #                            attributes (e.g. {"subagent_id": "..."})
 #   PARSE_INCLUDE_SIDECHAIN  "1" to parse sidechain (subagent) lines; by
@@ -51,7 +54,7 @@
 US=$'\x1f'
 
 # Classifies one transcript line per input line. Output record fields:
-# kind ts model input_tokens output_tokens cache_create cache_read payload
+# kind ts promptId model input_tokens output_tokens cache_create cache_read payload
 # kind: a=assistant, t=tool_result user message, u=plain user message, s=skip
 _PARSER_JQ_PROG='
 def tonanos:
@@ -62,16 +65,17 @@ def tonanos:
   catch 0);
 (fromjson? // {}) as $m
 | (($m.timestamp // "") | tonanos | tostring) as $ts
+| ($m.promptId // "") as $pid
 | if ($m | type) != "object" or ($m.type // "") == "" then
-    ["s", "0", "", "0", "0", "0", "0", "{}"]
+    ["s", "0", "", "", "0", "0", "0", "0", "{}"]
   elif ($m.isSidechain == true and $skip_side == "1") then
-    ["s", "0", "", "0", "0", "0", "0", "{}"]
+    ["s", "0", "", "", "0", "0", "0", "0", "{}"]
   elif $m.type == "assistant" then
     ($m.message.content // []) as $rc
     | (if ($rc | type) == "string" then [{type: "text", text: $rc}]
        elif ($rc | type) == "array" then $rc else [] end) as $c
     | ($m.message.usage // $m.usage // {}) as $u
-    | ["a", $ts,
+    | ["a", $ts, $pid,
        ($m.message.model // $m.model // ""),
        (($u.input_tokens // 0) | tostring),
        (($u.output_tokens // 0) | tostring),
@@ -84,7 +88,7 @@ def tonanos:
     ($m.message.content // null) as $c
     | if ($c | type) == "array" and (($c[0].type // "") == "tool_result") then
         ($m.toolUseResult // null) as $tr
-        | ["t", $ts, "", "0", "0", "0", "0",
+        | ["t", $ts, $pid, "", "0", "0", "0", "0",
            ({c: $c,
              r: [$c[] | select(.tool_use_id?)
                  | {id: .tool_use_id,
@@ -101,9 +105,9 @@ def tonanos:
         (if ($c | type) == "array"
          then ([$c[] | select(.type == "text") | .text] | join("\n"))
          elif ($c | type) == "string" then $c else "" end) as $txt
-        | ["u", $ts, "", "0", "0", "0", "0", ({txt: $txt} | tojson)]
+        | ["u", $ts, $pid, "", "0", "0", "0", "0", ({txt: $txt} | tojson)]
       end
-  else ["s", $ts, "", "0", "0", "0", "0", "{}"]
+  else ["s", $ts, $pid, "", "0", "0", "0", "0", "{}"]
   end
 | join("\u001f")'
 
@@ -127,6 +131,7 @@ _parser_flush_llm_span() {
     span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
     span_start="${LLM_START_TIME:-$(get_time_nanos)}"
     span_end="${LLM_END_TIME:-$(get_time_nanos)}"
+    [ "$span_end" -lt "$span_start" ] 2>/dev/null && span_end="$span_start"
     provider=$(detect_provider "$CURRENT_MODEL")
     input_json=$(printf '%s' "$CONVERSATION_HISTORY" | jq -Rs '.')
     attrs=$(build_otlp_attributes "$(jq -n \
@@ -167,6 +172,7 @@ _parser_flush_llm_span() {
 # (input/output arrive as JSON string literals, kept encoded end to end)
 _parser_add_tool_span() {
     local attrs span extra
+    [ "$5" -lt "$4" ] 2>/dev/null && set -- "$1" "$2" "$3" "$4" "$4"
     extra="${PARSE_EXTRA_ATTRS}"
     [ -z "$extra" ] && extra="{}"
     attrs=$(build_otlp_attributes "$(jq -n \
@@ -211,16 +217,19 @@ parse_transcript_chunk() {
         echo "$CONVERSATION_HISTORY" | jq -e '.' >/dev/null 2>&1 || CONVERSATION_HISTORY="[]"
     fi
 
-    local KIND TS MODEL INP OUT CC CR PAYLOAD
-    while IFS="$US" read -r KIND TS MODEL INP OUT CC CR PAYLOAD; do
+    local KIND TS PID MODEL INP OUT CC CR PAYLOAD
+    while IFS="$US" read -r KIND TS PID MODEL INP OUT CC CR PAYLOAD; do
         PARSE_NEW_OFFSET=$((PARSE_NEW_OFFSET + 1))
-        [ "$KIND" = "s" ] || [ -z "$KIND" ] && {
-            if [ "$TS" -gt 0 ] 2>/dev/null; then
-                [ -z "$PARSE_FIRST_TS_NANOS" ] && PARSE_FIRST_TS_NANOS="$TS"
-                PARSE_LAST_TS_NANOS="$TS"
-            fi
+        [ "$KIND" = "s" ] || [ -z "$KIND" ] && continue
+        # Transcript lines are not strictly ordered across turn boundaries:
+        # a previous turn's trailing lines can be flushed to the file after
+        # the next turn starts. Attribute by promptId, not file position —
+        # rows from other turns are skipped (their offset is still consumed;
+        # they were either already parsed or belong to a finalized turn).
+        if [ -n "$PARSE_PROMPT_ID" ] && [ -n "$PID" ] && [ "$PID" != "$PARSE_PROMPT_ID" ]; then
             continue
-        }
+        fi
+        # Turn window comes only from rows that belong to this parse
         if [ "$TS" -gt 0 ] 2>/dev/null; then
             [ -z "$PARSE_FIRST_TS_NANOS" ] && PARSE_FIRST_TS_NANOS="$TS"
             PARSE_LAST_TS_NANOS="$TS"
@@ -297,25 +306,70 @@ save_parse_history() {
     return 0
 }
 
-# finalize_task_span TASK_SPAN_ID ROOT_SPAN_ID SESSION_ID FALLBACK_OUTPUT
-# Re-inserts the turn's Task span with transcript-derived start/end (the
-# single time source for all turn-scoped spans), input, output, and counts.
-# Appends to SPAN_BATCH; caller flushes.
-finalize_task_span() {
-    local task_span_id="$1" root_span_id="$2" session_id="$3" fallback_output="$4"
-    local task_end task_start task_output attrs span
-    task_end="${PARSE_LAST_TS_NANOS:-$(get_time_nanos)}"
-    task_start="${PARSE_FIRST_TS_NANOS:-$task_end}"
-    task_output="${PARSE_LAST_OUTPUT:-${fallback_output:-Completed}}"
-    attrs=$(build_otlp_attributes "$(jq -n \
-        --arg input "$PARSE_FIRST_USER_INPUT" \
-        --arg output "$task_output" \
-        --argjson llm "$PARSE_LLM_CALLS" \
-        --argjson tools "$PARSE_TOOL_CALLS" \
-        --arg session_id "$session_id" \
-        '{"judgment.span_kind": "task", "judgment.input": $input, "judgment.output": $output,
-          "llm_call_count": $llm, "tool_count": $tools, "judgment.session_id": $session_id}')")
-    span=$(build_otlp_span "$PARSE_TRACE_ID" "$task_span_id" "$root_span_id" "Task" "task" "$task_start" "$task_end" "$attrs" 20)
+# finalize_turn_root SESSION_ID WORKSPACE FALLBACK_OUTPUT
+# Re-inserts the current turn's ROOT span with transcript-derived window,
+# the turn's prompt as input, output, and counts. Reads turn identity from
+# the PARSE_* globals' companions (set by the caller): FIN_ROOT_SPAN_ID,
+# FIN_TURN_INPUT, FIN_TURN_STARTED, FIN_LINK_ATTRS. Appends to SPAN_BATCH.
+finalize_turn_root() {
+    local session_id="$1" workspace="$2" fallback_output="$3"
+    local t_end t_start t_out t_in extra link attrs span
+    t_end="${PARSE_LAST_TS_NANOS:-$(get_time_nanos)}"
+    t_start="${PARSE_FIRST_TS_NANOS:-${FIN_TURN_STARTED:-$t_end}}"
+    [ "$t_end" -lt "$t_start" ] 2>/dev/null && t_end="$t_start"
+    t_out="${PARSE_LAST_OUTPUT:-${fallback_output:-Completed}}"
+    t_in="${FIN_TURN_INPUT:-$PARSE_FIRST_USER_INPUT}"
+    link="${FIN_LINK_ATTRS}"
+    [ -z "$link" ] && link="{}"
+    extra=$(jq -cn --argjson llm "$PARSE_LLM_CALLS" --argjson tools "$PARSE_TOOL_CALLS" \
+        --argjson link "$link" \
+        '{llm_call_count: $llm, tool_count: $tools} + $link')
+    attrs=$(build_root_span_attrs "$session_id" "$workspace" "$t_in" "$t_out" "$extra")
+    span=$(build_otlp_span "$PARSE_TRACE_ID" "$FIN_ROOT_SPAN_ID" "" "Claude Code: $(workspace_display_name "$workspace")" "task" "$t_start" "$t_end" "$attrs" 20)
     SPAN_BATCH+=("$span")
+    return 0
+}
+
+# recover_open_turn SESSION_ID WORKSPACE TRANSCRIPT_PATH LABEL
+# Finalizes a turn whose Stop hook never ran (user interrupt, crash) or
+# whose flush failed: parses its transcript rows (promptId-filtered) under
+# its own trace root, closes the root, and advances state on success.
+# No-op when the session has no open turn.
+recover_open_turn() {
+    local session_id="$1" workspace="$2" transcript_path="$3" label="${4:-[interrupted by user]}"
+    local o_tid o_rid o_pid o_input o_started o_proj o_off
+    IFS=$'\x1f' read -r o_tid o_rid o_pid o_input o_started o_proj o_off \
+        <<< "$(get_session_fields "$session_id" trace_id root_span_id current_prompt_id current_turn_input turn_started project_id transcript_offset)"
+    [ -z "$o_tid" ] && return 0
+
+    local pfile="$transcript_path"
+    [ -z "$pfile" ] || [ ! -f "$pfile" ] && \
+        pfile=$(find "$HOME/.claude/projects" -name "${session_id}.jsonl" -type f 2>/dev/null | head -1)
+
+    PARSE_FILE="$pfile"
+    PARSE_OFFSET="${o_off:-0}"
+    PARSE_TRACE_ID="$o_tid"
+    PARSE_PROJECT_ID="$o_proj"
+    PARSE_SESSION_ID="$session_id"
+    PARSE_PARENT_SPAN_ID="$o_rid"
+    PARSE_PROMPT_ID="$o_pid"
+    PARSE_HISTORY_FILE=$(session_history_file "$session_id")
+    parse_transcript_chunk
+    PARSE_PROMPT_ID=""
+
+    FIN_ROOT_SPAN_ID="$o_rid"
+    FIN_TURN_INPUT="$o_input"
+    FIN_TURN_STARTED="$o_started"
+    FIN_LINK_ATTRS=$(previous_trace_link_attrs "$session_id")
+    finalize_turn_root "$session_id" "$workspace" "$label"
+    if flush_span_batch "$o_proj"; then
+        set_session_state_batch "$session_id" "transcript_offset" "$PARSE_NEW_OFFSET"
+        record_completed_trace "$session_id" "$o_tid" "$o_rid"
+        clear_session_keys "$session_id" trace_id root_span_id current_prompt_id current_turn_input turn_started
+        save_parse_history
+        log "INFO" "Recovered open turn: $PARSE_LLM_CALLS llm, $PARSE_TOOL_CALLS tool spans (session=$session_id)"
+    else
+        log "ERROR" "Open-turn recovery spans not delivered; will retry (session=$session_id)"
+    fi
     return 0
 }

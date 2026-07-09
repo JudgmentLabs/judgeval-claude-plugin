@@ -14,6 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 # shellcheck source=transcript_parser.sh
 source "$SCRIPT_DIR/transcript_parser.sh"
+hook_guard
 
 debug "SubagentStop hook triggered"
 tracing_enabled || { debug "Tracing disabled"; exit 0; }
@@ -32,14 +33,14 @@ PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // 
 [ -z "$PARENT_SESSION_ID" ] && { debug "No session ID"; exit 0; }
 
 # Get parent trace context (keyed by the parent session)
-IFS=$'\x1f' read -r TRACE_ID PROJECT_ID ROOT_SPAN_ID PARENT_TASK_SPAN_ID \
-    <<< "$(get_session_fields "$PARENT_SESSION_ID" trace_id project_id root_span_id current_task_span_id)"
+IFS=$'\x1f' read -r TRACE_ID PROJECT_ID ROOT_SPAN_ID \
+    <<< "$(get_session_fields "$PARENT_SESSION_ID" trace_id project_id root_span_id)"
 
 [ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
 [ -z "$PROJECT_ID" ] || [ -z "$ROOT_SPAN_ID" ] && { debug "No trace/project"; exit 0; }
 
-# Use task span as parent if available, otherwise root
-PARENT_SPAN_ID="${PARENT_TASK_SPAN_ID:-$ROOT_SPAN_ID}"
+# Subagents nest under the current turn's root span
+PARENT_SPAN_ID="$ROOT_SPAN_ID"
 SUBAGENT_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
 
 # The provided agent_transcript_path may not be written yet when this hook

@@ -1,13 +1,12 @@
 #!/bin/bash
 ###
-# Stop Hook - Finalizes the turn that just ended
+# Stop Hook - Finalizes the turn TRACE that just ended
 #
-# Parses the transcript lines added since the last processed offset,
-# creating LLM/tool spans under this turn's Task span, then finalizes the
-# Task span with transcript-derived duration, output, and counts. All spans
-# go out in one batched OTLP request. This makes traces fill in live per
-# turn, attributes spans to the correct turn, and bounds data loss if the
-# session is killed.
+# Parses the transcript rows belonging to this turn (attributed by
+# promptId — transcript lines are not strictly ordered across turns),
+# creates LLM/tool spans under the turn's root span, finalizes the root
+# with the turn's real window/output/counts, and ships everything in
+# bounded batches. State only advances when delivery succeeds.
 ###
 
 set -e
@@ -16,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 # shellcheck source=transcript_parser.sh
 source "$SCRIPT_DIR/transcript_parser.sh"
+hook_guard
 
 debug "Stop hook triggered"
 tracing_enabled || { debug "Tracing disabled"; exit 0; }
@@ -34,12 +34,11 @@ if [ -z "$SESSION_ID" ] && [ -n "$TRANSCRIPT_PATH" ]; then
 fi
 [ -z "$SESSION_ID" ] && { debug "No session ID"; exit 0; }
 
-IFS=$'\x1f' read -r TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID OFFSET \
-    <<< "$(get_session_fields "$SESSION_ID" trace_id project_id root_span_id current_task_span_id transcript_offset)"
+IFS=$'\x1f' read -r TRACE_ID ROOT_SPAN_ID PROJECT_ID PROMPT_ID TURN_INPUT TURN_STARTED OFFSET WORKSPACE \
+    <<< "$(get_session_fields "$SESSION_ID" trace_id root_span_id project_id current_prompt_id current_turn_input turn_started transcript_offset workspace)"
 
-[ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
-[ -z "$PROJECT_ID" ] || [ -z "$ROOT_SPAN_ID" ] && { debug "Missing trace state"; exit 0; }
-[ -z "$TASK_SPAN_ID" ] && { debug "No open task span"; exit 0; }
+[ -z "$TRACE_ID" ] && { debug "No open turn"; exit 0; }
+[ -z "$PROJECT_ID" ] || [ -z "$ROOT_SPAN_ID" ] && { debug "Missing turn state"; exit 0; }
 
 [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ] && \
     TRANSCRIPT_PATH=$(find "$HOME/.claude/projects" -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
@@ -49,20 +48,27 @@ PARSE_OFFSET="${OFFSET:-0}"
 PARSE_TRACE_ID="$TRACE_ID"
 PARSE_PROJECT_ID="$PROJECT_ID"
 PARSE_SESSION_ID="$SESSION_ID"
-PARSE_PARENT_SPAN_ID="$TASK_SPAN_ID"
+PARSE_PARENT_SPAN_ID="$ROOT_SPAN_ID"
+PARSE_PROMPT_ID="$PROMPT_ID"
 PARSE_HISTORY_FILE=$(session_history_file "$SESSION_ID")
 parse_transcript_chunk
+PARSE_PROMPT_ID=""
 
-finalize_task_span "$TASK_SPAN_ID" "$ROOT_SPAN_ID" "$SESSION_ID" "$LAST_ASSISTANT"
+FIN_ROOT_SPAN_ID="$ROOT_SPAN_ID"
+FIN_TURN_INPUT="$TURN_INPUT"
+FIN_TURN_STARTED="$TURN_STARTED"
+FIN_LINK_ATTRS=$(previous_trace_link_attrs "$SESSION_ID")
+finalize_turn_root "$SESSION_ID" "$WORKSPACE" "$LAST_ASSISTANT"
+
 if flush_span_batch "$PROJECT_ID"; then
-    # Only advance past these transcript lines once they are delivered;
-    # on failure the offset and open task span stay put, so the next
-    # prompt's stale-turn finalization (or the SessionEnd sweep) becomes
-    # a correctly-attributed retry instead of silent loss.
+    # Only advance past these transcript rows once delivered; on failure
+    # the open turn stays claimed and the next prompt (or SessionEnd)
+    # retries it with correct attribution instead of silently dropping it.
     set_session_state_batch "$SESSION_ID" "transcript_offset" "$PARSE_NEW_OFFSET"
-    clear_session_keys "$SESSION_ID" current_task_span_id
+    record_completed_trace "$SESSION_ID" "$TRACE_ID" "$ROOT_SPAN_ID"
+    clear_session_keys "$SESSION_ID" trace_id root_span_id current_prompt_id current_turn_input turn_started
     save_parse_history
-    log "INFO" "Turn finalized: $PARSE_LLM_CALLS llm, $PARSE_TOOL_CALLS tool spans (session=$SESSION_ID)"
+    log "INFO" "Turn finalized: $PARSE_LLM_CALLS llm, $PARSE_TOOL_CALLS tool spans (trace=$TRACE_ID)"
 else
     log "ERROR" "Turn spans not delivered; will retry from offset $PARSE_OFFSET (session=$SESSION_ID)"
 fi
