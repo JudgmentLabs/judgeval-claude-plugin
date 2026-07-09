@@ -49,10 +49,22 @@ MAPPED_TASK_SPAN_ID=""
 MAPPED_TURN_INDEX=""
 MAPPED_DESCRIPTION=""
 MAPPED_TRACED=""
+MAPPED_TRACE_START=""
+MAPPED_TASK_START=""
+MAPPED_PARENT_TRACE_END=""
+MAPPED_PARENT_TASK_INPUT_JSON=""
+MAPPED_PARENT_TASK_OUTPUT_JSON=""
+MAPPED_PARENT_LLM_CALLS=""
+MAPPED_PARENT_TOOL_CALLS=""
+MAPPED_PARENT_WORKSPACE=""
+MAPPED_PARENT_WORKSPACE_NAME=""
+MAPPED_PARENT_HOSTNAME=""
+MAPPED_PARENT_USERNAME=""
+MAPPED_PARENT_OS=""
 
 if [ -n "$SUBAGENT_ID" ]; then
-    IFS=$'\037' read -r MAPPED_PARENT_SESSION_ID MAPPED_TRACE_ID MAPPED_PROJECT_ID MAPPED_ROOT_SPAN_ID MAPPED_TASK_SPAN_ID MAPPED_TURN_INDEX MAPPED_DESCRIPTION MAPPED_TRACED \
-        <<< "$(get_session_fields "subagent:$SUBAGENT_ID" parent_session_id trace_id project_id root_span_id task_span_id turn_index description transcript_traced)"
+    IFS=$'\037' read -r MAPPED_PARENT_SESSION_ID MAPPED_TRACE_ID MAPPED_PROJECT_ID MAPPED_ROOT_SPAN_ID MAPPED_TASK_SPAN_ID MAPPED_TURN_INDEX MAPPED_DESCRIPTION MAPPED_TRACED MAPPED_TRACE_START MAPPED_TASK_START MAPPED_PARENT_TRACE_END MAPPED_PARENT_TASK_INPUT_JSON MAPPED_PARENT_TASK_OUTPUT_JSON MAPPED_PARENT_LLM_CALLS MAPPED_PARENT_TOOL_CALLS MAPPED_PARENT_WORKSPACE MAPPED_PARENT_WORKSPACE_NAME MAPPED_PARENT_HOSTNAME MAPPED_PARENT_USERNAME MAPPED_PARENT_OS \
+        <<< "$(get_session_fields "subagent:$SUBAGENT_ID" parent_session_id trace_id project_id root_span_id task_span_id turn_index description transcript_traced trace_start task_start parent_trace_end parent_task_input_json parent_task_output_json parent_llm_calls parent_tool_calls parent_workspace parent_workspace_name parent_hostname parent_username parent_os)"
 fi
 
 if [ "$MAPPED_TRACED" = "true" ]; then
@@ -93,6 +105,85 @@ fi
 # Use task span as parent if available, otherwise root
 PARENT_SPAN_ID="${PARENT_TASK_SPAN_ID:-$ROOT_SPAN_ID}"
 
+parent_update_id() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null && return
+    fi
+    echo 30
+}
+
+extend_parent_turn_spans() {
+    [ -n "$MAPPED_PARENT_TASK_INPUT_JSON" ] && [ -n "$MAPPED_PARENT_TASK_OUTPUT_JSON" ] || { debug "No stored parent attrs for late subagent parent update"; return; }
+    [ -n "$MAPPED_TRACE_START" ] && [ -n "$MAPPED_TASK_START" ] || { debug "No stored parent start time for late subagent parent update"; return; }
+    echo "$MAPPED_PARENT_TASK_INPUT_JSON" | jq -e 'type == "string"' >/dev/null 2>&1 || { debug "Invalid stored parent input attrs"; return; }
+    echo "$MAPPED_PARENT_TASK_OUTPUT_JSON" | jq -e 'type == "string"' >/dev/null 2>&1 || { debug "Invalid stored parent output attrs"; return; }
+
+    local parent_end="$END_TIME"
+    if [ -n "$MAPPED_PARENT_TRACE_END" ] && [ "$MAPPED_PARENT_TRACE_END" -gt "$parent_end" ] 2>/dev/null; then
+        parent_end="$MAPPED_PARENT_TRACE_END"
+    fi
+    if [ -n "$MAPPED_PARENT_TRACE_END" ] && [ "$parent_end" -le "$MAPPED_PARENT_TRACE_END" ] 2>/dev/null; then
+        return
+    fi
+
+    local update_id task_attrs task_span root_attrs root_span root_name
+    update_id=$(parent_update_id)
+
+    task_attrs=$(build_otlp_attributes "$(jq -n \
+        --arg span_kind "task" \
+        --argjson input "$MAPPED_PARENT_TASK_INPUT_JSON" \
+        --argjson output "$MAPPED_PARENT_TASK_OUTPUT_JSON" \
+        --argjson llm "${MAPPED_PARENT_LLM_CALLS:-0}" \
+        --argjson tools "${MAPPED_PARENT_TOOL_CALLS:-0}" \
+        --arg session_id "$PARENT_SESSION_ID" \
+        --argjson turn_index "${TURN_INDEX:-1}" \
+        '{
+          "judgment.span_kind": $span_kind,
+          "judgment.input": $input,
+          "judgment.output": $output,
+          "llm_call_count": $llm,
+          "tool_count": $tools,
+          "judgment.session_id": $session_id,
+          "session_id": $session_id,
+          "turn_index": $turn_index
+        }')"
+    )
+    task_span=$(build_otlp_span "$TRACE_ID" "$PARENT_TASK_SPAN_ID" "$ROOT_SPAN_ID" "Task" "task" "$MAPPED_TASK_START" "$parent_end" "$task_attrs" "$update_id")
+    insert_span "$PROJECT_ID" "$task_span" >/dev/null || debug "Failed to extend parent task span"
+
+    root_attrs=$(build_otlp_attributes "$(jq -n \
+        --arg span_kind "task" \
+        --argjson input "$MAPPED_PARENT_TASK_INPUT_JSON" \
+        --argjson output "$MAPPED_PARENT_TASK_OUTPUT_JSON" \
+        --arg session_id "$PARENT_SESSION_ID" \
+        --arg workspace "${MAPPED_PARENT_WORKSPACE:-}" \
+        --arg hostname "${MAPPED_PARENT_HOSTNAME:-$(get_hostname)}" \
+        --arg username "${MAPPED_PARENT_USERNAME:-$(get_username)}" \
+        --arg os "${MAPPED_PARENT_OS:-$(get_os)}" \
+        --argjson turn_index "${TURN_INDEX:-1}" \
+        '{
+          "judgment.span_kind": $span_kind,
+          "judgment.input": $input,
+          "judgment.output": $output,
+          "judgment.session_id": $session_id,
+          "session_id": $session_id,
+          "turn_index": $turn_index,
+          "workspace": $workspace,
+          "hostname": $hostname,
+          "username": $username,
+          "os": $os,
+          "source": "claude-code"
+        }')"
+    )
+    root_name="Claude Code Turn: ${MAPPED_PARENT_WORKSPACE_NAME:-Claude Code}"
+    root_span=$(build_otlp_span "$TRACE_ID" "$ROOT_SPAN_ID" "" "$root_name" "task" "$MAPPED_TRACE_START" "$parent_end" "$root_attrs" "$update_id")
+    insert_span "$PROJECT_ID" "$root_span" >/dev/null || debug "Failed to extend parent root span"
+
+    if [ -n "$SUBAGENT_ID" ] && [ -n "$MAPPED_TRACE_ID" ]; then
+        set_session_state_batch "subagent:$SUBAGENT_ID" "parent_trace_end" "$parent_end"
+    fi
+}
+
 # Generate subagent container span
 SUBAGENT_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
 START_TIME=$(get_time_nanos)
@@ -127,28 +218,48 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
     
     CURRENT_OUTPUT=""
     CURRENT_MODEL=""
-    CURRENT_PROMPT_TOKENS=0
-    CURRENT_COMPLETION_TOKENS=0
-    LLM_START_TIME=""
-    LLM_END_TIME=""
-    PENDING_TOOLS="{}"
+CURRENT_PROMPT_TOKENS=0
+CURRENT_COMPLETION_TOKENS=0
+CURRENT_CACHE_CREATION=0
+CURRENT_CACHE_READ=0
+LLM_START_TIME=""
+LLM_END_TIME=""
+PENDING_TOOLS="{}"
+CURRENT_TOOL_USES="[]"
+
+subagent_llm_output_text() {
+    local text="$1" tool_uses="$2"
+    if [ -n "$text" ]; then
+        printf '%s\n' "$text"
+        return
+    fi
+    echo "$tool_uses" | jq -r 'if type == "array" and length > 0 then "Tool use: " + ([.[] | .name // "tool"] | join(", ")) else "" end' 2>/dev/null
+}
 
     create_subagent_llm_span() {
         local output="$1" model="$2" prompt="$3" completion="$4"
-        local start_time="$5" end_time="$6"
+        local cache_create="${5:-0}" cache_read="${6:-0}" start_time="$7" end_time="$8"
         [ -z "$output" ] && return
         
-        local span_id provider input_json output_json attrs span
+        local span_id provider input_json output_json attrs span usage_meta
         span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
         provider=$(detect_provider "$model")
         
         input_json=$(jq -n --arg d "$TASK_DESCRIPTION" '[{role: "user", content: $d}]' | jq -c '.' | jq -Rs '.')
         output_json=$(jq -n --arg c "$output" '[{role: "assistant", content: $c}]' | jq -c '.' | jq -Rs '.')
+        usage_meta=$(jq -n \
+            --argjson inp "${prompt:-0}" \
+            --argjson out "${completion:-0}" \
+            --argjson cc "${cache_create:-0}" \
+            --argjson cr "${cache_read:-0}" \
+            '{input_tokens: $inp, output_tokens: $out, cache_creation_input_tokens: $cc, cache_read_input_tokens: $cr}' | jq -c '.')
         
         attrs=$(build_otlp_attributes "$(jq -n \
             --arg span_kind "llm" --argjson input "$input_json" --argjson output "$output_json" \
             --arg model "${model:-claude}" --arg provider "$provider" \
             --argjson prompt "$prompt" --argjson completion "$completion" \
+            --argjson cache_create "${cache_create:-0}" --argjson cache_read "${cache_read:-0}" \
+            --arg usage_meta "$usage_meta" \
             --arg session_id "$PARENT_SESSION_ID" \
             --argjson turn_index "${TURN_INDEX:-1}" \
             '{
@@ -159,6 +270,9 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
               "judgment.llm.model": $model,
               "judgment.usage.non_cached_input_tokens": $prompt,
               "judgment.usage.output_tokens": $completion,
+              "judgment.usage.cache_creation_input_tokens": $cache_create,
+              "judgment.usage.cache_read_input_tokens": $cache_read,
+              "judgment.usage.metadata": $usage_meta,
               "subagent_id": "'"$SUBAGENT_ID"'",
               "judgment.session_id": $session_id,
               "session_id": $session_id,
@@ -220,9 +334,11 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
             
             if [ "$CONTENT_TYPE" = "tool_result" ]; then
                 # Flush pending LLM span
-                if [ -n "$CURRENT_OUTPUT" ]; then
-                    create_subagent_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$LLM_START_TIME" "$LLM_END_TIME"
+                LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
+                if [ -n "$LLM_OUTPUT" ]; then
+                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
                     CURRENT_OUTPUT=""
+                    CURRENT_TOOL_USES="[]"
                 fi
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
                 
@@ -252,14 +368,15 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
                     fi
                 done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null)
                 
-                CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0
+                CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0
             else
                 # Regular user message - flush pending LLM span
-                if [ -n "$CURRENT_OUTPUT" ]; then
-                    create_subagent_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$LLM_START_TIME" "$LLM_END_TIME"
+                LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
+                if [ -n "$LLM_OUTPUT" ]; then
+                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
                 fi
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
-                CURRENT_OUTPUT=""; CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0
+                CURRENT_OUTPUT=""; CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0; CURRENT_TOOL_USES="[]"
             fi
             
         elif [ "$MSG_TYPE" = "assistant" ]; then
@@ -275,6 +392,8 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
                     if [ -n "$TOOL_ID" ] && [ -n "$TOOL_NAME" ]; then
                         PENDING_TOOLS=$(echo "$PENDING_TOOLS" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --arg input "$TOOL_INPUT" --arg start "$(iso_to_nanos "$TIMESTAMP")" \
                             '.[$id] = {name: $name, input: $input, start: $start}')
+                        CURRENT_TOOL_USES=$(echo "$CURRENT_TOOL_USES" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --argjson input "$TOOL_INPUT" \
+                            '. += [{type: "tool_use", id: $id, name: $name, input: $input}]')
                     fi
                 done < <(echo "$line" | jq -c '.message.content[] | select(.type == "tool_use")' 2>/dev/null)
             fi
@@ -295,6 +414,10 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
                 [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$INP
                 OUT=$(echo "$USAGE" | jq -r '.output_tokens // 0')
                 [ "$OUT" != "null" ] && [ "$OUT" -gt 0 ] 2>/dev/null && CURRENT_COMPLETION_TOKENS=$OUT
+                CC=$(echo "$USAGE" | jq -r '.cache_creation_input_tokens // 0')
+                [ "$CC" != "null" ] && [ "$CC" -gt 0 ] 2>/dev/null && CURRENT_CACHE_CREATION=$CC
+                CR=$(echo "$USAGE" | jq -r '.cache_read_input_tokens // 0')
+                [ "$CR" != "null" ] && [ "$CR" -gt 0 ] 2>/dev/null && CURRENT_CACHE_READ=$CR
             fi
             
             # Save last output for subagent summary
@@ -303,7 +426,8 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
     done < "$SUBAGENT_TRANSCRIPT"
     
     # Flush final LLM span
-    [ -n "$CURRENT_OUTPUT" ] && create_subagent_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$LLM_START_TIME" "$LLM_END_TIME"
+    LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
+    [ -n "$LLM_OUTPUT" ] && create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
 fi
 
 # Create the subagent container span
@@ -344,6 +468,7 @@ SUBAGENT_ATTRS=$(build_otlp_attributes "$(jq -n \
 SUBAGENT_SPAN=$(build_otlp_span "$TRACE_ID" "$SUBAGENT_SPAN_ID" "$PARENT_SPAN_ID" "Subagent: ${SUBAGENT_ID:-task}" "task" "$START_TIME" "$END_TIME" "$SUBAGENT_ATTRS" 0)
 
 if insert_span "$PROJECT_ID" "$SUBAGENT_SPAN"; then
+    extend_parent_turn_spans
     if [ -n "$SUBAGENT_ID" ] && [ -n "$MAPPED_TRACE_ID" ]; then
         set_session_state_batch "subagent:$SUBAGENT_ID" \
             "transcript_traced" "true" \

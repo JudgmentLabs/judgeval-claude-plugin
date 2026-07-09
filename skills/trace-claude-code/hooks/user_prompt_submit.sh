@@ -52,8 +52,8 @@ fi
 
 if [ -n "$TASK_NOTIFICATION_ID" ]; then
     PARENT_KEY="subagent:$TASK_NOTIFICATION_ID"
-    IFS=$'\x1f' read -r PARENT_SESSION_ID TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID TOOL_SPAN_ID TURN_INDEX PARENT_WORKSPACE DESCRIPTION \
-        <<< "$(get_session_fields "$PARENT_KEY" parent_session_id trace_id project_id root_span_id task_span_id tool_span_id turn_index workspace description)"
+    IFS=$'\x1f' read -r PARENT_SESSION_ID TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID TOOL_SPAN_ID TURN_INDEX PARENT_WORKSPACE DESCRIPTION TRACE_START TASK_START PARENT_TRACE_END PARENT_TASK_INPUT_JSON PARENT_TASK_OUTPUT_JSON PARENT_LLM_CALLS PARENT_TOOL_CALLS PARENT_WORKSPACE_NAME PARENT_HOSTNAME PARENT_USERNAME PARENT_OS \
+        <<< "$(get_session_fields "$PARENT_KEY" parent_session_id trace_id project_id root_span_id task_span_id tool_span_id turn_index workspace description trace_start task_start parent_trace_end parent_task_input_json parent_task_output_json parent_llm_calls parent_tool_calls parent_workspace_name parent_hostname parent_username parent_os)"
 
     TASK_STATUS=$(printf '%s\n' "$PROMPT" | extract_task_notification_tag "status")
     TASK_SUMMARY=$(printf '%s\n' "$PROMPT" | extract_task_notification_tag "summary")
@@ -96,6 +96,77 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
         )
         SPAN=$(build_otlp_span "$TRACE_ID" "$SPAN_ID" "$TASK_SPAN_ID" "Subagent Result: ${TASK_SUMMARY:-$TASK_NOTIFICATION_ID}" "task" "$NOW" "$NOW" "$ATTRS" 20)
         insert_span "$PROJECT_ID" "$SPAN" >/dev/null || debug "Failed to attach subagent task notification"
+
+        if [ -n "$PARENT_TASK_INPUT_JSON" ] && [ -n "$PARENT_TASK_OUTPUT_JSON" ] &&
+           [ -n "$TRACE_START" ] && [ -n "$TASK_START" ] &&
+           echo "$PARENT_TASK_INPUT_JSON" | jq -e 'type == "string"' >/dev/null 2>&1 &&
+           echo "$PARENT_TASK_OUTPUT_JSON" | jq -e 'type == "string"' >/dev/null 2>&1; then
+            PARENT_END="$NOW"
+            if [ -n "$PARENT_TRACE_END" ] && [ "$PARENT_TRACE_END" -gt "$PARENT_END" ] 2>/dev/null; then
+                PARENT_END="$PARENT_TRACE_END"
+            fi
+            if [ -z "$PARENT_TRACE_END" ] || [ "$PARENT_END" -gt "$PARENT_TRACE_END" ] 2>/dev/null; then
+                if command -v python3 >/dev/null 2>&1; then
+                    UPDATE_ID=$(python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || echo 30)
+                else
+                    UPDATE_ID=30
+                fi
+
+                PARENT_TASK_ATTRS=$(build_otlp_attributes "$(jq -n \
+                    --arg span_kind "task" \
+                    --argjson input "$PARENT_TASK_INPUT_JSON" \
+                    --argjson output "$PARENT_TASK_OUTPUT_JSON" \
+                    --argjson llm "${PARENT_LLM_CALLS:-0}" \
+                    --argjson tools "${PARENT_TOOL_CALLS:-0}" \
+                    --arg session_id "$PARENT_SESSION_ID" \
+                    --argjson turn_index "${TURN_INDEX:-1}" \
+                    '{
+                      "judgment.span_kind": $span_kind,
+                      "judgment.input": $input,
+                      "judgment.output": $output,
+                      "llm_call_count": $llm,
+                      "tool_count": $tools,
+                      "judgment.session_id": $session_id,
+                      "session_id": $session_id,
+                      "turn_index": $turn_index
+                    }')"
+                )
+                PARENT_TASK_SPAN=$(build_otlp_span "$TRACE_ID" "$TASK_SPAN_ID" "$ROOT_SPAN_ID" "Task" "task" "$TASK_START" "$PARENT_END" "$PARENT_TASK_ATTRS" "$UPDATE_ID")
+                insert_span "$PROJECT_ID" "$PARENT_TASK_SPAN" >/dev/null || debug "Failed to extend parent task span for task notification"
+
+                PARENT_ROOT_ATTRS=$(build_otlp_attributes "$(jq -n \
+                    --arg span_kind "task" \
+                    --argjson input "$PARENT_TASK_INPUT_JSON" \
+                    --argjson output "$PARENT_TASK_OUTPUT_JSON" \
+                    --arg session_id "$PARENT_SESSION_ID" \
+                    --arg workspace "${PARENT_WORKSPACE:-}" \
+                    --arg hostname "${PARENT_HOSTNAME:-$(get_hostname)}" \
+                    --arg username "${PARENT_USERNAME:-$(get_username)}" \
+                    --arg os "${PARENT_OS:-$(get_os)}" \
+                    --argjson turn_index "${TURN_INDEX:-1}" \
+                    '{
+                      "judgment.span_kind": $span_kind,
+                      "judgment.input": $input,
+                      "judgment.output": $output,
+                      "judgment.session_id": $session_id,
+                      "session_id": $session_id,
+                      "turn_index": $turn_index,
+                      "workspace": $workspace,
+                      "hostname": $hostname,
+                      "username": $username,
+                      "os": $os,
+                      "source": "claude-code"
+                    }')"
+                )
+                PARENT_ROOT_NAME="Claude Code Turn: ${PARENT_WORKSPACE_NAME:-$WORKSPACE_NAME}"
+                PARENT_ROOT_SPAN=$(build_otlp_span "$TRACE_ID" "$ROOT_SPAN_ID" "" "$PARENT_ROOT_NAME" "task" "$TRACE_START" "$PARENT_END" "$PARENT_ROOT_ATTRS" "$UPDATE_ID")
+                insert_span "$PROJECT_ID" "$PARENT_ROOT_SPAN" >/dev/null || debug "Failed to extend parent root span for task notification"
+                set_session_state_batch "$PARENT_KEY" "parent_trace_end" "$PARENT_END"
+            fi
+        else
+            debug "No stored parent attrs for task notification parent update"
+        fi
+
         log "INFO" "Subagent task notification attached: task=$TASK_NOTIFICATION_ID trace=$TRACE_ID session=$PARENT_SESSION_ID"
     else
         log "WARN" "Skipping orphan task notification without parent trace mapping: task=$TASK_NOTIFICATION_ID session=$SESSION_ID"

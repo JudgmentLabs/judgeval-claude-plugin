@@ -16,6 +16,26 @@ _turn_history_for_llm() {
     fi
 }
 
+_turn_llm_output_text() {
+    local text="$1" tool_uses="$2"
+    if [ -n "$text" ]; then
+        printf '%s\n' "$text"
+        return
+    fi
+    echo "$tool_uses" | jq -r 'if type == "array" and length > 0 then "Tool use: " + ([.[] | .name // "tool"] | join(", ")) else "" end' 2>/dev/null
+}
+
+_turn_append_assistant_history() {
+    local history="$1" text="$2" tool_uses="$3"
+    if echo "$tool_uses" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        echo "$history" | jq --arg c "$text" --argjson tools "$tool_uses" \
+            '. += [{role: "assistant", content: $tools, text: $c, tool_uses: $tools}]'
+    else
+        echo "$history" | jq --arg c "$text" \
+            '. += [{role: "assistant", content: [{type: "text", text: $c}], text: $c}]'
+    fi
+}
+
 _turn_extract_text_content() {
     local content="$1"
     if echo "$content" | jq -e '.' >/dev/null 2>&1; then
@@ -284,6 +304,8 @@ _turn_create_tool_span() {
                     "root_span_id" "$TURN_ROOT_SPAN_ID" \
                     "task_span_id" "$TURN_TASK_SPAN_ID" \
                     "tool_span_id" "$span_id" \
+                    "trace_start" "${TURN_TRACE_START:-}" \
+                    "task_start" "${TURN_TASK_START:-}" \
                     "turn_index" "${TURN_INDEX:-1}" \
                     "workspace" "${TURN_WORKSPACE:-}" \
                     "description" "${subagent_description:-$tool_name}"
@@ -305,7 +327,7 @@ parse_turn_transcript() {
 
     local current_output="" current_model="" current_prompt_tokens=0 current_completion_tokens=0
     local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time=""
-    local conversation_history pending_tools="{}"
+    local conversation_history pending_tools="{}" current_tool_uses="[]" llm_output
     conversation_history=$(_turn_normalized_messages_through "$conv_file" "${TURN_OFFSET:-0}" "all")
 
     while IFS= read -r line; do
@@ -323,10 +345,12 @@ parse_turn_transcript() {
             fi
 
             if [ "$content_type" = "tool_result" ]; then
-                if [ -n "$current_output" ]; then
-                    _turn_create_llm_span "$current_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
-                    conversation_history=$(echo "$conversation_history" | jq --arg c "$current_output" '. += [{role: "assistant", content: [{type: "text", text: $c}], text: $c}]')
+                llm_output=$(_turn_llm_output_text "$current_output" "$current_tool_uses")
+                if [ -n "$llm_output" ]; then
+                    _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
+                    conversation_history=$(_turn_append_assistant_history "$conversation_history" "$current_output" "$current_tool_uses")
                     current_output=""
+                    current_tool_uses="[]"
                 fi
                 llm_start_time=$(iso_to_nanos "$timestamp")
 
@@ -379,10 +403,12 @@ parse_turn_transcript() {
                 current_cache_creation=0
                 current_cache_read=0
             else
-                if [ -n "$current_output" ]; then
-                    _turn_create_llm_span "$current_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
-                    conversation_history=$(echo "$conversation_history" | jq --arg c "$current_output" '. += [{role: "assistant", content: [{type: "text", text: $c}], text: $c}]')
+                llm_output=$(_turn_llm_output_text "$current_output" "$current_tool_uses")
+                if [ -n "$llm_output" ]; then
+                    _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
+                    conversation_history=$(_turn_append_assistant_history "$conversation_history" "$current_output" "$current_tool_uses")
                     current_output=""
+                    current_tool_uses="[]"
                 fi
                 text=$(_turn_extract_text_content "$content")
                 if [ -n "$text" ]; then
@@ -395,6 +421,7 @@ parse_turn_transcript() {
                 current_completion_tokens=0
                 current_cache_creation=0
                 current_cache_read=0
+                current_tool_uses="[]"
             fi
         elif [ "$msg_type" = "assistant" ]; then
             llm_end_time=$(iso_to_nanos "$timestamp")
@@ -410,6 +437,8 @@ parse_turn_transcript() {
                     if [ -n "$tool_id" ] && [ -n "$tool_name" ]; then
                         pending_tools=$(echo "$pending_tools" | jq --arg id "$tool_id" --arg name "$tool_name" --arg input "$tool_input" --arg start "$tool_start" \
                             '.[$id] = {name: $name, input: $input, start: $start}')
+                        current_tool_uses=$(echo "$current_tool_uses" | jq --arg id "$tool_id" --arg name "$tool_name" --argjson input "$tool_input" \
+                            '. += [{type: "tool_use", id: $id, name: $name, input: $input}]')
                     fi
                 done < <(echo "$line" | jq -c '.message.content[] | select(.type == "tool_use")' 2>/dev/null)
             fi
@@ -436,8 +465,9 @@ parse_turn_transcript() {
         fi
     done < <(tail -n +$(( ${TURN_OFFSET:-0} + 1 )) "$conv_file")
 
-    if [ -n "$current_output" ]; then
-        _turn_create_llm_span "$current_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
+    llm_output=$(_turn_llm_output_text "$current_output" "$current_tool_uses")
+    if [ -n "$llm_output" ]; then
+        _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
     fi
 
     TURN_NEW_OFFSET=$(count_file_lines "$conv_file")
@@ -508,6 +538,10 @@ finalize_turn_trace() {
     )
     root_span=$(build_otlp_span "$TURN_TRACE_ID" "$TURN_ROOT_SPAN_ID" "" "Claude Code Turn: ${TURN_WORKSPACE_NAME:-Claude Code}" "task" "${TURN_TRACE_START:-${TURN_TASK_START:-$final_end}}" "$final_end" "$root_attrs" 20)
     insert_span "$TURN_PROJECT_ID" "$root_span" >/dev/null || debug "Failed to finalize root span"
+
+    TURN_FINAL_END="$final_end"
+    TURN_TASK_INPUT_ATTR_JSON="$task_input_json"
+    TURN_TASK_OUTPUT_ATTR_JSON="$task_output_json"
 
     log "INFO" "Trace finalized: $TURN_TRACE_ID (session=$TURN_SESSION_ID, turn=${TURN_INDEX:-1}, llm=$TURN_LLM_CALLS, tools=$TURN_TOOL_CALLS)"
     return 0

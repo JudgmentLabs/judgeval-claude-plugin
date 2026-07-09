@@ -65,6 +65,32 @@ set_session_state_batch "$SESSION_ID" \
     "last_trace_id" "$TRACE_ID" \
     "last_root_span_id" "$ROOT_SPAN_ID"
 
+PARENT_HOSTNAME=$(get_hostname)
+PARENT_USERNAME=$(get_username)
+PARENT_OS=$(get_os)
+while IFS= read -r SUBAGENT_KEY; do
+    [ -z "$SUBAGENT_KEY" ] && continue
+    set_session_state_batch "$SUBAGENT_KEY" \
+        "trace_start" "${TURN_TRACE_START:-$TRACE_START}" \
+        "task_start" "${TURN_TASK_START:-$TASK_START}" \
+        "parent_trace_end" "${TURN_FINAL_END:-}" \
+        "parent_task_input_json" "${TURN_TASK_INPUT_ATTR_JSON:-}" \
+        "parent_task_output_json" "${TURN_TASK_OUTPUT_ATTR_JSON:-}" \
+        "parent_llm_calls" "${TURN_LLM_CALLS:-0}" \
+        "parent_tool_calls" "${TURN_TOOL_CALLS:-0}" \
+        "parent_workspace" "${WORKSPACE:-}" \
+        "parent_workspace_name" "${WORKSPACE_NAME:-Claude Code}" \
+        "parent_hostname" "$PARENT_HOSTNAME" \
+        "parent_username" "$PARENT_USERNAME" \
+        "parent_os" "$PARENT_OS"
+done < <(load_state | jq -r --arg trace "$TRACE_ID" '
+    .sessions
+    | to_entries[]
+    | select(.key | startswith("subagent:"))
+    | select(.value.trace_id == $trace)
+    | .key
+')
+
 clear_session_keys "$SESSION_ID" \
     active_trace_id active_root_span_id active_task_span_id active_trace_start \
     active_task_start active_prompt active_transcript_offset
