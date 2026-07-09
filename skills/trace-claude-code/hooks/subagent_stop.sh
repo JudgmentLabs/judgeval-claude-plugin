@@ -27,16 +27,65 @@ SUBAGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // .subagent_id // empty' 2>/dev/
 SUBAGENT_TRANSCRIPT=$(echo "$INPUT" | jq -r '.agent_transcript_path // empty' 2>/dev/null)
 TASK_DESCRIPTION=$(echo "$INPUT" | jq -r '.task // .description // empty' 2>/dev/null)
 PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // empty' 2>/dev/null)
+BACKGROUND_SUBAGENT_ID=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].id // empty' 2>/dev/null)
+BACKGROUND_DESCRIPTION=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].description // empty' 2>/dev/null)
 
-# Get parent trace context
-TRACE_ID=$(get_session_state "$PARENT_SESSION_ID" "active_trace_id")
-[ -z "$TRACE_ID" ] && TRACE_ID=$(get_state_value "current_trace_id")
-[ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
+# Claude Code can emit a control SubagentStop while the real background task is
+# still running. Its transcript path does not exist, and the real task id is in
+# background_tasks, so skip it instead of creating an empty placeholder span.
+if [ -n "$BACKGROUND_SUBAGENT_ID" ] && [ "$BACKGROUND_SUBAGENT_ID" != "$SUBAGENT_ID" ] &&
+   { [ -z "$SUBAGENT_TRANSCRIPT" ] || [ ! -f "$SUBAGENT_TRANSCRIPT" ]; }; then
+    debug "Skipping control SubagentStop for $SUBAGENT_ID; background task $BACKGROUND_SUBAGENT_ID is still running"
+    exit 0
+fi
 
-PARENT_TASK_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "active_task_span_id")
-PROJECT_ID=$(get_session_state "$PARENT_SESSION_ID" "project_id")
-ROOT_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "active_root_span_id")
-TURN_INDEX=$(get_session_state "$PARENT_SESSION_ID" "turn_count")
+# Get parent trace context. Prefer the durable Agent-tool mapping because async
+# subagents can finish after the parent turn has already finalized.
+MAPPED_PARENT_SESSION_ID=""
+MAPPED_TRACE_ID=""
+MAPPED_PROJECT_ID=""
+MAPPED_ROOT_SPAN_ID=""
+MAPPED_TASK_SPAN_ID=""
+MAPPED_TURN_INDEX=""
+MAPPED_DESCRIPTION=""
+MAPPED_TRACED=""
+
+if [ -n "$SUBAGENT_ID" ]; then
+    IFS=$'\037' read -r MAPPED_PARENT_SESSION_ID MAPPED_TRACE_ID MAPPED_PROJECT_ID MAPPED_ROOT_SPAN_ID MAPPED_TASK_SPAN_ID MAPPED_TURN_INDEX MAPPED_DESCRIPTION MAPPED_TRACED \
+        <<< "$(get_session_fields "subagent:$SUBAGENT_ID" parent_session_id trace_id project_id root_span_id task_span_id turn_index description transcript_traced)"
+fi
+
+if [ "$MAPPED_TRACED" = "true" ]; then
+    debug "Subagent transcript already traced: $SUBAGENT_ID"
+    exit 0
+fi
+
+TRACE_ID="$MAPPED_TRACE_ID"
+PROJECT_ID="$MAPPED_PROJECT_ID"
+ROOT_SPAN_ID="$MAPPED_ROOT_SPAN_ID"
+PARENT_TASK_SPAN_ID="$MAPPED_TASK_SPAN_ID"
+TURN_INDEX="$MAPPED_TURN_INDEX"
+
+if [ -n "$MAPPED_PARENT_SESSION_ID" ]; then
+    PARENT_SESSION_ID="$MAPPED_PARENT_SESSION_ID"
+fi
+if [ -z "$TASK_DESCRIPTION" ] && [ -n "$MAPPED_DESCRIPTION" ]; then
+    TASK_DESCRIPTION="$MAPPED_DESCRIPTION"
+fi
+if [ -z "$TASK_DESCRIPTION" ] && [ -n "$BACKGROUND_DESCRIPTION" ]; then
+    TASK_DESCRIPTION="$BACKGROUND_DESCRIPTION"
+fi
+
+if [ -z "$TRACE_ID" ]; then
+    TRACE_ID=$(get_session_state "$PARENT_SESSION_ID" "active_trace_id")
+    [ -z "$TRACE_ID" ] && TRACE_ID=$(get_state_value "current_trace_id")
+    PARENT_TASK_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "active_task_span_id")
+    PROJECT_ID=$(get_session_state "$PARENT_SESSION_ID" "project_id")
+    ROOT_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "active_root_span_id")
+    TURN_INDEX=$(get_session_state "$PARENT_SESSION_ID" "turn_count")
+fi
+
+[ -z "$TRACE_ID" ] && { debug "No current trace or mapped subagent trace"; exit 0; }
 
 [ -z "$PROJECT_ID" ] && { debug "No project ID"; exit 0; }
 [ -z "$ROOT_SPAN_ID" ] && { debug "No root span"; exit 0; }
@@ -273,6 +322,11 @@ SUBAGENT_ATTRS=$(build_otlp_attributes "$(jq -n \
 SUBAGENT_SPAN=$(build_otlp_span "$TRACE_ID" "$SUBAGENT_SPAN_ID" "$PARENT_SPAN_ID" "Subagent: ${SUBAGENT_ID:-task}" "task" "$START_TIME" "$END_TIME" "$SUBAGENT_ATTRS" 0)
 
 if insert_span "$PROJECT_ID" "$SUBAGENT_SPAN"; then
+    if [ -n "$SUBAGENT_ID" ] && [ -n "$MAPPED_TRACE_ID" ]; then
+        set_session_state_batch "subagent:$SUBAGENT_ID" \
+            "transcript_traced" "true" \
+            "subagent_span_id" "$SUBAGENT_SPAN_ID"
+    fi
     log "INFO" "Subagent traced: ${SUBAGENT_ID:-unknown} (llm=$LLM_CALLS, tools=$TOOL_CALLS)"
 else
     log "ERROR" "Failed to create subagent span"
