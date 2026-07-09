@@ -118,6 +118,13 @@ get_session_state() {
     load_state | jq -r ".sessions[\"$1\"].$2 // empty"
 }
 
+get_session_fields() {
+    local session_id="$1"
+    shift
+    load_state | jq -r --arg s "$session_id" --args \
+        '(.sessions[$s] // {}) as $x | [$ARGS.positional[] as $k | ($x[$k] // "")] | join("\u001f")' "$@"
+}
+
 set_session_state() {
     with_lock _set_session_state_unsafe "$1" "$2" "$3"
 }
@@ -148,6 +155,19 @@ _set_session_state_batch_unsafe() {
         shift 2
     done
     save_state "$state"
+}
+
+clear_session_keys() {
+    with_lock _clear_session_keys_unsafe "$@"
+}
+
+_clear_session_keys_unsafe() {
+    local session_id="$1"
+    shift
+    local state
+    state=$(load_state)
+    save_state "$(echo "$state" | jq --arg s "$session_id" --args \
+        'reduce $ARGS.positional[] as $k (.; del(.sessions[$s][$k]))' "$@")"
 }
 
 # API Operations
@@ -338,6 +358,27 @@ build_otlp_attributes() {
 
 # Utilities
 generate_uuid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
+generate_trace_id() {
+    local trace_id
+    trace_id=$(generate_uuid | sed 's/-//g' | head -c 32)
+    while [ ${#trace_id} -lt 32 ]; do trace_id="${trace_id}0"; done
+    echo "$trace_id"
+}
+generate_span_id() { generate_uuid | sed 's/-//g' | head -c 16; }
+count_file_lines() {
+    local file="$1"
+    [ -n "$file" ] && [ -f "$file" ] || { echo 0; return; }
+    awk 'END{print NR}' "$file" 2>/dev/null || echo 0
+}
+find_transcript_path() {
+    local session_id="$1" provided="${2:-}"
+    if [ -n "$provided" ] && [ -f "$provided" ]; then
+        echo "$provided"
+        return 0
+    fi
+    [ -z "$session_id" ] && return 1
+    find "$HOME/.claude/projects" -name "${session_id}.jsonl" -type f 2>/dev/null | head -1
+}
 get_hostname() { hostname 2>/dev/null || echo "unknown"; }
 get_username() { whoami 2>/dev/null || echo "unknown"; }
 get_os() { uname -s 2>/dev/null || echo "unknown"; }

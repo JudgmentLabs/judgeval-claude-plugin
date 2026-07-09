@@ -21,9 +21,9 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 
 [ -z "$TOOL_NAME" ] || [ -z "$SESSION_ID" ] && { debug "No tool/session"; exit 0; }
 
-TOOL_COUNT=$(get_session_state "$SESSION_ID" "current_turn_tool_count")
+TOOL_COUNT=$(get_session_state "$SESSION_ID" "active_tool_count")
 TOOL_COUNT=$((${TOOL_COUNT:-0} + 1))
-set_session_state "$SESSION_ID" "current_turn_tool_count" "$TOOL_COUNT"
+set_session_state "$SESSION_ID" "active_tool_count" "$TOOL_COUNT"
 
 log "INFO" "Tool used: $TOOL_NAME (count=$TOOL_COUNT)"
 exit 0

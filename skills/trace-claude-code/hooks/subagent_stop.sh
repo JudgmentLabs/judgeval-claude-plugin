@@ -29,12 +29,14 @@ TASK_DESCRIPTION=$(echo "$INPUT" | jq -r '.task // .description // empty' 2>/dev
 PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // empty' 2>/dev/null)
 
 # Get parent trace context
-TRACE_ID=$(get_state_value "current_trace_id")
+TRACE_ID=$(get_session_state "$PARENT_SESSION_ID" "active_trace_id")
+[ -z "$TRACE_ID" ] && TRACE_ID=$(get_state_value "current_trace_id")
 [ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
 
-PARENT_TASK_SPAN_ID=$(get_session_state "$TRACE_ID" "current_task_span_id")
-PROJECT_ID=$(get_session_state "$TRACE_ID" "project_id")
-ROOT_SPAN_ID=$(get_session_state "$TRACE_ID" "root_span_id")
+PARENT_TASK_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "active_task_span_id")
+PROJECT_ID=$(get_session_state "$PARENT_SESSION_ID" "project_id")
+ROOT_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "active_root_span_id")
+TURN_INDEX=$(get_session_state "$PARENT_SESSION_ID" "turn_count")
 
 [ -z "$PROJECT_ID" ] && { debug "No project ID"; exit 0; }
 [ -z "$ROOT_SPAN_ID" ] && { debug "No root span"; exit 0; }
@@ -96,6 +98,8 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
             --arg span_kind "llm" --argjson input "$input_json" --argjson output "$output_json" \
             --arg model "${model:-claude}" --arg provider "$provider" \
             --argjson prompt "$prompt" --argjson completion "$completion" \
+            --arg session_id "$PARENT_SESSION_ID" \
+            --argjson turn_index "${TURN_INDEX:-1}" \
             '{
               "judgment.span_kind": $span_kind,
               "judgment.input": $input,
@@ -104,7 +108,10 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
               "judgment.llm.model": $model,
               "judgment.usage.non_cached_input_tokens": $prompt,
               "judgment.usage.output_tokens": $completion,
-              "subagent_id": "'"$SUBAGENT_ID"'"
+              "subagent_id": "'"$SUBAGENT_ID"'",
+              "judgment.session_id": $session_id,
+              "session_id": $session_id,
+              "turn_index": $turn_index
             }')")
         
         span=$(build_otlp_span "$TRACE_ID" "$span_id" "$SUBAGENT_SPAN_ID" "${model:-anthropic.messages.create}" "llm" "$start_time" "$end_time" "$attrs" 20)
@@ -124,8 +131,8 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
         input_json=$(echo "$tool_input" | jq -c '.' 2>/dev/null | jq -Rs '.')
         output_json=$(echo "$tool_output" | jq -Rs '.')
         
-        attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" --arg subagent_id "$SUBAGENT_ID" \
-            '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "subagent_id": $subagent_id}')")
+        attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" --arg subagent_id "$SUBAGENT_ID" --arg session_id "$PARENT_SESSION_ID" --argjson turn_index "${TURN_INDEX:-1}" \
+            '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "subagent_id": $subagent_id, "judgment.session_id": $session_id, "session_id": $session_id, "turn_index": $turn_index}')")
         
         span=$(build_otlp_span "$TRACE_ID" "$span_id" "$SUBAGENT_SPAN_ID" "$tool_name" "tool" "$start_time" "$end_time" "$attrs" 20)
         
@@ -249,13 +256,18 @@ SUBAGENT_ATTRS=$(build_otlp_attributes "$(jq -n \
     --arg subagent_id "${SUBAGENT_ID:-unknown}" \
     --argjson llm_calls "$LLM_CALLS" \
     --argjson tool_calls "$TOOL_CALLS" \
+    --arg session_id "$PARENT_SESSION_ID" \
+    --argjson turn_index "${TURN_INDEX:-1}" \
     '{
         "judgment.span_kind": $span_kind,
         "judgment.input": $input,
         "judgment.output": $output,
         "subagent_id": $subagent_id,
         "llm_call_count": $llm_calls,
-        "tool_count": $tool_calls
+        "tool_count": $tool_calls,
+        "judgment.session_id": $session_id,
+        "session_id": $session_id,
+        "turn_index": $turn_index
     }')")
 
 SUBAGENT_SPAN=$(build_otlp_span "$TRACE_ID" "$SUBAGENT_SPAN_ID" "$PARENT_SPAN_ID" "Subagent: ${SUBAGENT_ID:-task}" "task" "$START_TIME" "$END_TIME" "$SUBAGENT_ATTRS" 0)

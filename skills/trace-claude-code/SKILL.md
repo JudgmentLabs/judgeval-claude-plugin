@@ -4,8 +4,8 @@ Automatically trace Claude Code sessions to Judgeval for observability and debug
 
 ## Features
 
-- **Session Tracing**: Capture complete conversation sessions with start/end times
-- **Turn Tracking**: Track each user prompt as a separate turn
+- **Session Grouping**: Group Claude turns into the same Judgment session with `judgment.session_id`
+- **Turn Tracing**: Create one Judgment trace for each user prompt/assistant response turn
 - **LLM Spans**: Log every model call with input/output and token usage
 - **Tool Spans**: Track tool invocations (file operations, terminal, MCP tools)
 - **Cache Metrics**: Track cache creation and read tokens for prompt caching
@@ -13,17 +13,15 @@ Automatically trace Claude Code sessions to Judgeval for observability and debug
 ## Trace Structure
 
 ```
-Session (task span)
-├── Turn 1 (task span)
-│   ├── claude-opus-4-5 (llm span)
-│   ├── Read: file.py (tool span)
-│   ├── Subagent: code-reviewer (task span)  ← Subagent with nested spans
-│   │   ├── claude-3-5-haiku (llm span)
-│   │   ├── Read (tool span)
-│   │   └── claude-3-5-haiku (llm span)
-│   └── claude-opus-4-5 (llm span)
-└── Turn 2 (task span)
-    └── ...
+Claude session_id
+├── Trace for user turn 1
+│   └── Task
+│       ├── claude-opus-4-5 (llm span)
+│       ├── Read (tool span)
+│       └── Subagent: code-reviewer (task span)
+└── Trace for user turn 2
+    └── Task
+        └── claude-opus-4-5 (llm span)
 ```
 
 ## Setup
@@ -56,20 +54,21 @@ This will prompt you for:
 
 | Hook | Trigger | Action |
 |------|---------|--------|
-| `session_start.sh` | Session begins | Creates root trace span |
-| `user_prompt_submit.sh` | User sends prompt | Creates Turn span |
-| `post_tool_use.sh` | Tool completes | Tracks tool count |
-| `stop_hook.sh` | Response complete | Marks turn for finalization |
+| `session_start.sh` | Session begins | Records session metadata |
+| `user_prompt_submit.sh` | User sends prompt | Creates a new trace and Task span for the turn |
+| `post_tool_use.sh` | Tool completes | Tracks active tool count |
+| `stop_hook.sh` | Response complete | Parses transcript delta and finalizes the turn trace |
 | `subagent_stop.sh` | Subagent completes | Parses subagent transcript, creates nested spans |
-| `session_end.sh` | Session ends | Creates LLM/Tool spans, finalizes session |
+| `session_end.sh` | Session ends | Fallback-finalizes any open turn trace |
 
 ## Span Attributes
 
-### Session Span
+### Turn Root Span
 - `judgment.span_kind`: "task"
-- `judgment.input`: Session description
-- `judgment.output`: Completion summary
-- `turn_count`: Number of turns
+- `judgment.input`: User prompt
+- `judgment.output`: Assistant response
+- `judgment.session_id`: Claude Code session ID
+- `turn_index`: Turn number within the Claude session
 
 ### LLM Span
 - `judgment.span_kind`: "llm"

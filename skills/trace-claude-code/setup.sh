@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOKS_DIR="$SCRIPT_DIR/hooks"
 
 # Verify hooks exist
-for hook in common.sh session_start.sh post_tool_use.sh stop_hook.sh session_end.sh user_prompt_submit.sh subagent_stop.sh; do
+for hook in common.sh turn_trace_common.sh session_start.sh post_tool_use.sh stop_hook.sh session_end.sh user_prompt_submit.sh subagent_stop.sh; do
     if [ ! -f "$HOOKS_DIR/$hook" ]; then
         echo "❌ Error: Missing hook script: $HOOKS_DIR/$hook"
         exit 1
@@ -244,12 +244,12 @@ echo ""
 echo "Configuration saved to: $SETTINGS_FILE"
 echo ""
 echo "Hooks configured:"
-echo "  • SessionStart      - Creates trace root when session begins"
-echo "  • UserPromptSubmit  - Creates Turn container for each user message"
-echo "  • PostToolUse       - Captures tool calls as children of Turn"
-echo "  • Stop              - Creates LLM span and finalizes Turn"
+echo "  • SessionStart      - Records Claude session metadata"
+echo "  • UserPromptSubmit  - Creates one trace for each user message"
+echo "  • PostToolUse       - Tracks tool activity during the active turn"
+echo "  • Stop              - Creates LLM/tool spans and finalizes the turn trace"
 echo "  • SubagentStop      - Traces subagent (Task tool) execution"
-echo "  • SessionEnd        - Finalizes trace when session ends"
+echo "  • SessionEnd        - Fallback-finalizes any open turn trace"
 echo ""
 echo "Settings:"
 echo "  • API URL: $JUDGMENT_API_URL"
