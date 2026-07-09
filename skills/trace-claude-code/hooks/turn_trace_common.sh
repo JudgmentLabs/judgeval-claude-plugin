@@ -91,6 +91,12 @@ _turn_normalized_messages() {
             | select(.line > $start and (($end == 0) or (.line <= $end)))
             | normalize
             | select(
+                (((.text // "") | length) > 0)
+                or (((.tool_uses // []) | length) > 0)
+                or (.role == "tool")
+                or (.tool_result != null)
+              )
+            | select(
                 if $mode == "input" then
                   (.role != "assistant") or (((.tool_uses // []) | length) > 0)
                 elif $mode == "assistant" then
@@ -99,6 +105,15 @@ _turn_normalized_messages() {
               )
           )
         ' "$file"
+}
+
+_turn_normalized_messages_through() {
+    local file="$1" end_line="${2:-0}" mode="${3:-all}"
+    if [ "${end_line:-0}" -gt 0 ] 2>/dev/null; then
+        _turn_normalized_messages "$file" 0 "$end_line" "$mode"
+    else
+        echo "[]"
+    fi
 }
 
 _turn_context_payload() {
@@ -135,10 +150,10 @@ _turn_build_context_payloads() {
     local prior_messages current_input_messages current_output_messages all_messages input_messages output_messages
 
     if [ -n "$TURN_TRANSCRIPT_PATH" ] && [ -f "$TURN_TRANSCRIPT_PATH" ]; then
-        prior_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" 0 "${TURN_OFFSET:-0}" "all")
+        prior_messages=$(_turn_normalized_messages_through "$TURN_TRANSCRIPT_PATH" "${TURN_OFFSET:-0}" "all")
         current_input_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" "${TURN_OFFSET:-0}" "${TURN_NEW_OFFSET:-0}" "input")
         current_output_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" "${TURN_OFFSET:-0}" "${TURN_NEW_OFFSET:-0}" "assistant")
-        all_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" 0 "${TURN_NEW_OFFSET:-0}" "all")
+        all_messages=$(_turn_normalized_messages_through "$TURN_TRANSCRIPT_PATH" "${TURN_NEW_OFFSET:-0}" "all")
     else
         prior_messages="[]"
         current_input_messages=$(jq -cn --arg p "${TURN_PROMPT:-}" '[{role: "user", content: [{type: "text", text: $p}], text: $p}]')
@@ -272,7 +287,7 @@ parse_turn_transcript() {
     local current_output="" current_model="" current_prompt_tokens=0 current_completion_tokens=0
     local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time=""
     local conversation_history pending_tools="{}"
-    conversation_history=$(_turn_normalized_messages "$conv_file" 0 "${TURN_OFFSET:-0}" "all")
+    conversation_history=$(_turn_normalized_messages_through "$conv_file" "${TURN_OFFSET:-0}" "all")
 
     while IFS= read -r line; do
         [ -z "$line" ] && continue
