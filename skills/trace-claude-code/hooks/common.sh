@@ -248,7 +248,10 @@ get_project_id() {
     debug "Resolving project: $name"
     local resp pid
 
-    resp=$(curl -sf -X POST \
+    # Bounded like every other API call: an unbounded curl here hangs the
+    # UserPromptSubmit hook until Claude Code kills it, and since the kill
+    # prevents caching, every subsequent prompt repeats the hang.
+    resp=$(curl -sf --max-time 5 --connect-timeout 3 -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "Content-Type: application/json" \
@@ -263,7 +266,7 @@ get_project_id() {
     fi
 
     debug "Creating project: $name"
-    resp=$(curl -sf -X POST \
+    resp=$(curl -sf --max-time 5 --connect-timeout 3 -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "Content-Type: application/json" \
