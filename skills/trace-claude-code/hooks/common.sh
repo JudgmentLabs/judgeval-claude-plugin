@@ -2,9 +2,10 @@
 # Common utilities for Judgeval Claude Code tracing hooks
 
 # Configuration
-export LOG_FILE="$HOME/.claude/state/judgeval_hook.log"
-export STATE_FILE="$HOME/.claude/state/judgeval_state.json"
-export LOCK_DIR="$HOME/.claude/state/judgeval.lock.d"
+# Overridable for tests
+export LOG_FILE="${JUDGEVAL_LOG_FILE:-$HOME/.claude/state/judgeval_hook.log}"
+export STATE_FILE="${JUDGEVAL_STATE_FILE:-$HOME/.claude/state/judgeval_state.json}"
+export LOCK_DIR="${JUDGEVAL_LOCK_DIR:-$HOME/.claude/state/judgeval.lock.d}"
 export DEBUG="${JUDGEVAL_CC_DEBUG:-false}"
 DEBUG_ON=""
 [ "$(echo "$DEBUG" | tr '[:upper:]' '[:lower:]')" = "true" ] && DEBUG_ON=1
@@ -416,24 +417,43 @@ ensure_trace() {
     span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
     start_time=$(get_time_nanos)
 
+    # Claim trace creation atomically: SessionStart and UserPromptSubmit can
+    # race for the same session (back-to-back in -p mode); without the lock
+    # both mint roots and one clobbers the other's state. The network post
+    # happens OUTSIDE the lock — if the loser's post never happens, nothing
+    # is lost, and if the winner's root post fails, SessionEnd re-posts the
+    # root span with the same id.
+    if ! with_lock _reserve_trace_unsafe "$session_id" "$trace_id" "$span_id" "$project_id" "$start_time" "$initial_offset" "$workspace"; then
+        TRACE_ID=$(get_session_state "$session_id" "trace_id")
+        [ -n "$TRACE_ID" ] && { debug "Trace already created by concurrent hook"; return 0; }
+        log "ERROR" "Could not reserve trace for session $session_id"
+        return 1
+    fi
+
     local link_attrs
     link_attrs=$(previous_trace_link_attrs "$session_id")
     attrs=$(build_root_span_attrs "$session_id" "$workspace" "" "$link_attrs")
     span=$(build_otlp_span "$trace_id" "$span_id" "" "Claude Code: $(workspace_display_name "$workspace")" "task" "$start_time" "$start_time" "$attrs" 0)
-    insert_span_sync "$project_id" "$span" >/dev/null || { log "ERROR" "Failed to create session root"; return 1; }
-
-    set_session_state_batch "$session_id" \
-        "trace_id" "$trace_id" \
-        "root_span_id" "$span_id" \
-        "project_id" "$project_id" \
-        "workspace" "${workspace:-}" \
-        "started" "$start_time" \
-        "transcript_offset" "$initial_offset"
+    insert_span_sync "$project_id" "$span" >/dev/null || log "ERROR" "Root span post failed (will re-post at session end)"
 
     TRACE_ID="$trace_id"
     log "INFO" "Created trace: $trace_id (session=$session_id)"
     return 0
 }
+
+# Returns 1 if this session already has a trace (caller lost the race).
+_reserve_trace_unsafe() {
+    local sid="$1" tid="$2" rid="$3" pid="$4" st="$5" off="$6" ws="$7"
+    local state existing
+    state=$(load_state)
+    existing=$(echo "$state" | jq -r --arg s "$sid" '.sessions[$s].trace_id // empty')
+    [ -n "$existing" ] && return 1
+    save_state "$(echo "$state" | jq --arg s "$sid" --arg tid "$tid" --arg rid "$rid" \
+        --arg pid "$pid" --arg st "$st" --arg off "$off" --arg ws "$ws" \
+        '.sessions[$s] = (.sessions[$s] // {}) + {trace_id: $tid, root_span_id: $rid,
+          project_id: $pid, started: $st, transcript_offset: $off, workspace: $ws}')"
+}
+
 
 
 # Time Utilities

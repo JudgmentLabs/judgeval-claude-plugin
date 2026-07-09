@@ -71,7 +71,18 @@ LINK_ATTRS=$(previous_trace_link_attrs "$SESSION_ID")
 SESSION_ATTRS=$(build_root_span_attrs "$SESSION_ID" "$WORKSPACE" "${LAST_OUTPUT:-Completed}" "$LINK_ATTRS")
 SESSION_SPAN=$(build_otlp_span "$TRACE_ID" "$ROOT_SPAN_ID" "" "Claude Code: $(workspace_display_name "$WORKSPACE")" "task" "$SESSION_START" "$END_TIME" "$SESSION_ATTRS" 20)
 SPAN_BATCH+=("$SESSION_SPAN")
-flush_span_batch "$PROJECT_ID" || debug "Failed to finalize session"
+# Last hook for this session: retry once, and make final failure loud —
+# a silent failure here leaves the trace looking permanently in-progress.
+if flush_span_batch "$PROJECT_ID"; then
+    save_parse_history
+else
+    sleep 1
+    if flush_span_batch "$PROJECT_ID"; then
+        save_parse_history
+    else
+        log "ERROR" "Session finalize spans not delivered (trace=$TRACE_ID)"
+    fi
+fi
 
 # Remember this trace so a resumed session's next trace can link back to
 # it, then clean up only this session's live state; other sessions keep

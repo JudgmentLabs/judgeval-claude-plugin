@@ -285,9 +285,15 @@ parse_transcript_chunk() {
 
     _parser_flush_llm_span
 
-    if [ -n "$PARSE_HISTORY_FILE" ]; then
-        echo "$CONVERSATION_HISTORY" > "$PARSE_HISTORY_FILE" 2>/dev/null || true
-    fi
+    # History is persisted by the caller via save_parse_history AFTER a
+    # successful flush — writing it here would double-append these messages
+    # when a failed flush is retried from the same offset.
+    PARSE_FINAL_HISTORY="$CONVERSATION_HISTORY"
+    return 0
+}
+
+save_parse_history() {
+    [ -n "$PARSE_HISTORY_FILE" ] && echo "$PARSE_FINAL_HISTORY" > "$PARSE_HISTORY_FILE" 2>/dev/null
     return 0
 }
 

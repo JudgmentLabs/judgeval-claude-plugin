@@ -54,10 +54,16 @@ PARSE_HISTORY_FILE=$(session_history_file "$SESSION_ID")
 parse_transcript_chunk
 
 finalize_task_span "$TASK_SPAN_ID" "$ROOT_SPAN_ID" "$SESSION_ID" "$LAST_ASSISTANT"
-flush_span_batch "$PROJECT_ID" || debug "Failed to send turn spans"
-
-set_session_state_batch "$SESSION_ID" "transcript_offset" "$PARSE_NEW_OFFSET"
-clear_session_keys "$SESSION_ID" current_task_span_id
-
-log "INFO" "Turn finalized: $PARSE_LLM_CALLS llm, $PARSE_TOOL_CALLS tool spans (session=$SESSION_ID)"
+if flush_span_batch "$PROJECT_ID"; then
+    # Only advance past these transcript lines once they are delivered;
+    # on failure the offset and open task span stay put, so the next
+    # prompt's stale-turn finalization (or the SessionEnd sweep) becomes
+    # a correctly-attributed retry instead of silent loss.
+    set_session_state_batch "$SESSION_ID" "transcript_offset" "$PARSE_NEW_OFFSET"
+    clear_session_keys "$SESSION_ID" current_task_span_id
+    save_parse_history
+    log "INFO" "Turn finalized: $PARSE_LLM_CALLS llm, $PARSE_TOOL_CALLS tool spans (session=$SESSION_ID)"
+else
+    log "ERROR" "Turn spans not delivered; will retry from offset $PARSE_OFFSET (session=$SESSION_ID)"
+fi
 exit 0
