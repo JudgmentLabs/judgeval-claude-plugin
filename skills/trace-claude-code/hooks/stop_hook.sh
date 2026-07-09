@@ -247,6 +247,14 @@ SKIP_TRACE_REASON=$(get_session_state "$SESSION_ID" "skip_trace_reason")
 if [ -n "$SKIP_TRACE_REASON" ]; then
     debug "Skipping Stop hook for session $SESSION_ID: $SKIP_TRACE_REASON"
     attach_task_notification_followup
+    # Advance the offset past the notification and relay records; they are
+    # already attached to the parent trace, and the next interactive turn
+    # must not re-parse them into its own trace as duplicate LLM spans.
+    SKIP_TRANSCRIPT=$(find_transcript_path "$SESSION_ID" "$TRANSCRIPT_PATH" || true)
+    if [ -n "$SKIP_TRANSCRIPT" ] && [ -f "$SKIP_TRANSCRIPT" ]; then
+        set_session_state_batch "$SESSION_ID" \
+            "transcript_offset" "$(count_file_lines "$SKIP_TRANSCRIPT")"
+    fi
     clear_session_keys "$SESSION_ID" \
         skip_trace_reason parent_session_id parent_trace_id \
         task_notification_project_id task_notification_root_span_id task_notification_task_span_id \
