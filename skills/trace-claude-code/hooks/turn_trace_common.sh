@@ -2,7 +2,7 @@
 # Shared helpers for finalizing one Claude Code user turn as one trace.
 
 _turn_json_string() {
-    jq -Rs '.'
+    jq -Rs 'rtrimstr("\n")'
 }
 
 _turn_history_for_llm() {
@@ -191,6 +191,7 @@ _turn_build_context_payloads() {
 _turn_create_llm_span() {
     local output="$1" model="$2" prompt_tokens="$3" completion_tokens="$4" history="$5"
     local cache_create="${6:-0}" cache_read="${7:-0}" start_time="$8" end_time="$9"
+    local request_id="${10:-}"
     [ -z "$output" ] && return
 
     local span_id span_start span_end input_json output_json attrs span provider usage_meta history_json input_payload output_payload output_messages_json
@@ -203,6 +204,14 @@ _turn_create_llm_span() {
 
     provider=$(detect_provider "$model")
     history_json=$(_turn_history_for_llm "$history")
+
+    local emitted_request_ids="${TURN_EMITTED_REQUEST_IDS:-}"
+    [ -z "$emitted_request_ids" ] && emitted_request_ids="{}"
+    if [ -n "$request_id" ] && echo "$emitted_request_ids" | jq -e --arg id "$request_id" '.[$id] == true' >/dev/null 2>&1; then
+        debug "Skipping duplicate LLM span for requestId=$request_id"
+        return
+    fi
+
     input_payload=$(_turn_context_payload "$history_json" "" "false")
     output_messages_json=$(jq -cn \
         --argjson history "$history_json" \
@@ -252,6 +261,9 @@ _turn_create_llm_span() {
     if insert_span "$TURN_PROJECT_ID" "$span" >/dev/null; then
         TURN_LLM_CALLS=$((TURN_LLM_CALLS + 1))
         TURN_LAST_OUTPUT="$output"
+        if [ -n "$request_id" ]; then
+            TURN_EMITTED_REQUEST_IDS=$(echo "$emitted_request_ids" | jq --arg id "$request_id" '.[$id] = true')
+        fi
         debug "LLM span: ${model:-claude}"
     fi
 }
@@ -321,12 +333,13 @@ parse_turn_transcript() {
     TURN_LAST_OUTPUT=""
     TURN_TASK_INPUT="${TURN_PROMPT:-}"
     TURN_NEW_OFFSET="${TURN_OFFSET:-0}"
+    TURN_EMITTED_REQUEST_IDS="{}"
 
     local conv_file="$TURN_TRANSCRIPT_PATH"
     [ -n "$conv_file" ] && [ -f "$conv_file" ] || return 0
 
     local current_output="" current_model="" current_prompt_tokens=0 current_completion_tokens=0
-    local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time=""
+    local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time="" current_request_id=""
     local conversation_history pending_tools="{}" current_tool_uses="[]" llm_output
     conversation_history=$(_turn_normalized_messages_through "$conv_file" "${TURN_OFFSET:-0}" "all")
 
@@ -347,10 +360,11 @@ parse_turn_transcript() {
             if [ "$content_type" = "tool_result" ]; then
                 llm_output=$(_turn_llm_output_text "$current_output" "$current_tool_uses")
                 if [ -n "$llm_output" ]; then
-                    _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
+                    _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time" "$current_request_id"
                     conversation_history=$(_turn_append_assistant_history "$conversation_history" "$current_output" "$current_tool_uses")
                     current_output=""
                     current_tool_uses="[]"
+                    current_request_id=""
                 fi
                 llm_start_time=$(iso_to_nanos "$timestamp")
 
@@ -402,13 +416,15 @@ parse_turn_transcript() {
                 current_completion_tokens=0
                 current_cache_creation=0
                 current_cache_read=0
+                current_request_id=""
             else
                 llm_output=$(_turn_llm_output_text "$current_output" "$current_tool_uses")
                 if [ -n "$llm_output" ]; then
-                    _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
+                    _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time" "$current_request_id"
                     conversation_history=$(_turn_append_assistant_history "$conversation_history" "$current_output" "$current_tool_uses")
                     current_output=""
                     current_tool_uses="[]"
+                    current_request_id=""
                 fi
                 text=$(_turn_extract_text_content "$content")
                 if [ -n "$text" ]; then
@@ -422,9 +438,13 @@ parse_turn_transcript() {
                 current_cache_creation=0
                 current_cache_read=0
                 current_tool_uses="[]"
+                current_request_id=""
             fi
         elif [ "$msg_type" = "assistant" ]; then
             llm_end_time=$(iso_to_nanos "$timestamp")
+            local request_id
+            request_id=$(echo "$line" | jq -r '.requestId // .request_id // empty' 2>/dev/null)
+            [ -n "$request_id" ] && current_request_id="$request_id"
 
             if echo "$line" | jq -e '.message.content | type == "array"' >/dev/null 2>&1; then
                 while IFS= read -r tool_use; do
@@ -467,7 +487,7 @@ parse_turn_transcript() {
 
     llm_output=$(_turn_llm_output_text "$current_output" "$current_tool_uses")
     if [ -n "$llm_output" ]; then
-        _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
+        _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time" "$current_request_id"
     fi
 
     TURN_NEW_OFFSET=$(count_file_lines "$conv_file")

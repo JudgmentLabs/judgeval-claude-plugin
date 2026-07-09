@@ -226,6 +226,7 @@ LLM_START_TIME=""
 LLM_END_TIME=""
 PENDING_TOOLS="{}"
 CURRENT_TOOL_USES="[]"
+CONVERSATION_HISTORY="[]"
 
 subagent_llm_output_text() {
     local text="$1" tool_uses="$2"
@@ -236,17 +237,81 @@ subagent_llm_output_text() {
     echo "$tool_uses" | jq -r 'if type == "array" and length > 0 then "Tool use: " + ([.[] | .name // "tool"] | join(", ")) else "" end' 2>/dev/null
 }
 
+subagent_history_for_llm() {
+    local history="$1"
+    if echo "$history" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        echo "$history"
+    elif [ -n "${TASK_DESCRIPTION:-}" ]; then
+        jq -cn --arg d "$TASK_DESCRIPTION" '[{role: "user", content: [{type: "text", text: $d}], text: $d}]'
+    else
+        echo "[]"
+    fi
+}
+
+subagent_extract_text_content() {
+    local content="$1"
+    if echo "$content" | jq -e '.' >/dev/null 2>&1; then
+        echo "$content" | jq -r 'if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null
+    else
+        echo "$content"
+    fi
+}
+
+subagent_append_assistant_history() {
+    local history="$1" text="$2" tool_uses="$3" timestamp="$4"
+    if echo "$tool_uses" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        echo "$history" | jq --arg ts "$timestamp" --arg c "$text" --argjson tools "$tool_uses" \
+            '. += [{role: "assistant", timestamp: $ts, content: $tools, text: $c, tool_uses: $tools}]'
+    elif [ -n "$text" ]; then
+        echo "$history" | jq --arg ts "$timestamp" --arg c "$text" \
+            '. += [{role: "assistant", timestamp: $ts, content: [{type: "text", text: $c}], text: $c}]'
+    else
+        echo "$history"
+    fi
+}
+
+subagent_tool_output_from_result() {
+    local tool_result="$1" tool_use_result="$2"
+    if [ -n "$tool_use_result" ] && [ "$tool_use_result" != "null" ]; then
+        if echo "$tool_use_result" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            if echo "$tool_use_result" | jq -e '.file.content? // empty' >/dev/null 2>&1; then
+                echo "$tool_use_result" | jq -r '.file.content'
+            elif echo "$tool_use_result" | jq -e '.text? // empty' >/dev/null 2>&1; then
+                echo "$tool_use_result" | jq -r '.text'
+            elif echo "$tool_use_result" | jq -e '(.content? // empty) | type == "string"' >/dev/null 2>&1; then
+                echo "$tool_use_result" | jq -r '.content'
+            else
+                echo "$tool_use_result" | jq -c '.'
+            fi
+        else
+            echo "$tool_use_result" | jq -r '.'
+        fi
+    else
+        echo "$tool_result" | jq -r '
+          .content //
+          (if has("content") then (.content | tostring) else "result" end)
+        ' 2>/dev/null
+    fi
+}
+
     create_subagent_llm_span() {
         local output="$1" model="$2" prompt="$3" completion="$4"
         local cache_create="${5:-0}" cache_read="${6:-0}" start_time="$7" end_time="$8"
+        local history="${9:-[]}"
         [ -z "$output" ] && return
         
-        local span_id provider input_json output_json attrs span usage_meta
+        local span_id provider input_json output_json attrs span usage_meta history_json output_messages_json
         span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
         provider=$(detect_provider "$model")
         
-        input_json=$(jq -n --arg d "$TASK_DESCRIPTION" '[{role: "user", content: $d}]' | jq -c '.' | jq -Rs '.')
-        output_json=$(jq -n --arg c "$output" '[{role: "assistant", content: $c}]' | jq -c '.' | jq -Rs '.')
+        history_json=$(subagent_history_for_llm "$history")
+        input_json=$(echo "$history_json" | jq -c '.' | jq -Rs '.')
+        output_messages_json=$(jq -cn \
+            --argjson history "$history_json" \
+            --arg c "$output" \
+            --arg ts "${end_time:-}" \
+            '$history + [{role: "assistant", timestamp_nanos: $ts, content: [{type: "text", text: $c}], text: $c}]')
+        output_json=$(echo "$output_messages_json" | jq -c '.' | jq -Rs '.')
         usage_meta=$(jq -n \
             --argjson inp "${prompt:-0}" \
             --argjson out "${completion:-0}" \
@@ -336,7 +401,8 @@ subagent_llm_output_text() {
                 # Flush pending LLM span
                 LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
                 if [ -n "$LLM_OUTPUT" ]; then
-                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
+                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY"
+                    CONVERSATION_HISTORY=$(subagent_append_assistant_history "$CONVERSATION_HISTORY" "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES" "$TIMESTAMP")
                     CURRENT_OUTPUT=""
                     CURRENT_TOOL_USES="[]"
                 fi
@@ -348,12 +414,7 @@ subagent_llm_output_text() {
                 while IFS= read -r TOOL_RESULT; do
                     [ -z "$TOOL_RESULT" ] && continue
                     TOOL_USE_ID=$(echo "$TOOL_RESULT" | jq -r '.tool_use_id // empty')
-                    
-                    if [ -n "$TOOL_USE_RESULT" ] && [ "$TOOL_USE_RESULT" != "null" ]; then
-                        TOOL_OUT=$(echo "$TOOL_USE_RESULT" | jq -r '.text // .content // "completed"' 2>/dev/null)
-                    else
-                        TOOL_OUT=$(echo "$TOOL_RESULT" | jq -r '.content // "result"')
-                    fi
+                    TOOL_OUT=$(subagent_tool_output_from_result "$TOOL_RESULT" "$TOOL_USE_RESULT")
                     
                     if [ -n "$TOOL_USE_ID" ]; then
                         PENDING=$(echo "$PENDING_TOOLS" | jq -r ".\"$TOOL_USE_ID\" // empty")
@@ -366,6 +427,11 @@ subagent_llm_output_text() {
                             PENDING_TOOLS=$(echo "$PENDING_TOOLS" | jq "del(.\"$TOOL_USE_ID\")")
                         fi
                     fi
+                    CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq \
+                        --arg ts "$TIMESTAMP" \
+                        --arg id "$TOOL_USE_ID" \
+                        --arg c "$TOOL_OUT" \
+                        '. += [{role: "tool", timestamp: $ts, tool_use_id: $id, content: [{type: "tool_result", content: $c}], text: $c}]')
                 done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null)
                 
                 CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0
@@ -373,7 +439,13 @@ subagent_llm_output_text() {
                 # Regular user message - flush pending LLM span
                 LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
                 if [ -n "$LLM_OUTPUT" ]; then
-                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
+                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY"
+                    CONVERSATION_HISTORY=$(subagent_append_assistant_history "$CONVERSATION_HISTORY" "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES" "$TIMESTAMP")
+                fi
+                TEXT=$(subagent_extract_text_content "$CONTENT")
+                if [ -n "$TEXT" ]; then
+                    CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg ts "$TIMESTAMP" --arg c "$TEXT" \
+                        '. += [{role: "user", timestamp: $ts, content: [{type: "text", text: $c}], text: $c}]')
                 fi
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
                 CURRENT_OUTPUT=""; CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0; CURRENT_TOOL_USES="[]"
@@ -427,7 +499,10 @@ subagent_llm_output_text() {
     
     # Flush final LLM span
     LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
-    [ -n "$LLM_OUTPUT" ] && create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
+    if [ -n "$LLM_OUTPUT" ]; then
+        create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY"
+        CONVERSATION_HISTORY=$(subagent_append_assistant_history "$CONVERSATION_HISTORY" "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES" "$LLM_END_TIME")
+    fi
 fi
 
 # Create the subagent container span

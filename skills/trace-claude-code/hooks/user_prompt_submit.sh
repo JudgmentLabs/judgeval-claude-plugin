@@ -175,7 +175,24 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
     set_session_state_batch "$SESSION_ID" \
         "skip_trace_reason" "task-notification" \
         "parent_session_id" "${PARENT_SESSION_ID:-}" \
-        "parent_trace_id" "${TRACE_ID:-}"
+        "parent_trace_id" "${TRACE_ID:-}" \
+        "task_notification_project_id" "${PROJECT_ID:-}" \
+        "task_notification_root_span_id" "${ROOT_SPAN_ID:-}" \
+        "task_notification_task_span_id" "${TASK_SPAN_ID:-}" \
+        "task_notification_trace_start" "${TRACE_START:-}" \
+        "task_notification_task_start" "${TASK_START:-}" \
+        "task_notification_turn_index" "${TURN_INDEX:-1}" \
+        "task_notification_prompt" "$PROMPT" \
+        "task_notification_task_id" "$TASK_NOTIFICATION_ID" \
+        "task_notification_task_input_json" "${PARENT_TASK_INPUT_JSON:-}" \
+        "task_notification_task_output_json" "${PARENT_TASK_OUTPUT_JSON:-}" \
+        "task_notification_llm_calls" "${PARENT_LLM_CALLS:-0}" \
+        "task_notification_tool_calls" "${PARENT_TOOL_CALLS:-0}" \
+        "task_notification_workspace" "${PARENT_WORKSPACE:-}" \
+        "task_notification_workspace_name" "${PARENT_WORKSPACE_NAME:-$WORKSPACE_NAME}" \
+        "task_notification_hostname" "${PARENT_HOSTNAME:-}" \
+        "task_notification_username" "${PARENT_USERNAME:-}" \
+        "task_notification_os" "${PARENT_OS:-}"
     exit 0
 fi
 
