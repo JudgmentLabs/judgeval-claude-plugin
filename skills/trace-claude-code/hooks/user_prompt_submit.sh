@@ -210,6 +210,45 @@ PROJECT_ID=$(get_session_state "$SESSION_ID" "project_id")
 OFFSET=$(get_session_state "$SESSION_ID" "transcript_offset")
 [ -z "$OFFSET" ] && OFFSET=$(count_file_lines "$TRANSCRIPT_PATH")
 
+# Recover a previous turn whose Stop hook never finalized (e.g. killed at its
+# timeout). Snapshot it into a background finalize job, and start this turn
+# after the recovered records so they are not re-parsed into this trace.
+DANGLING_TRACE_ID=$(get_session_state "$SESSION_ID" "active_trace_id")
+if [ -n "$DANGLING_TRACE_ID" ] && [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+    IFS=$'\x1f' read -r D_ROOT D_TASK D_TRACE_START D_TASK_START D_PROMPT D_OFFSET D_TURN \
+        <<< "$(get_session_fields "$SESSION_ID" active_root_span_id active_task_span_id active_trace_start active_task_start active_prompt active_transcript_offset turn_count)"
+    D_END=$(count_file_lines "$TRANSCRIPT_PATH")
+    if [ -n "$D_ROOT" ] && [ -n "$D_TASK" ]; then
+        JOB=$(jq -cn \
+            --arg session_id "$SESSION_ID" \
+            --arg trace_id "$DANGLING_TRACE_ID" \
+            --arg project_id "${PROJECT_ID:-}" \
+            --arg project_name "$PROJECT" \
+            --arg root_span_id "$D_ROOT" \
+            --arg task_span_id "$D_TASK" \
+            --arg trace_start "$D_TRACE_START" \
+            --arg task_start "$D_TASK_START" \
+            --rawfile prompt <(printf '%s' "$D_PROMPT") \
+            --arg offset "${D_OFFSET:-0}" \
+            --arg end_offset "$D_END" \
+            --arg turn_index "${D_TURN:-1}" \
+            --arg workspace "${WORKSPACE:-}" \
+            --arg transcript_path "$TRANSCRIPT_PATH" \
+            '{type: "finalize", session_id: $session_id, trace_id: $trace_id,
+              project_id: $project_id, project_name: $project_name,
+              root_span_id: $root_span_id, task_span_id: $task_span_id,
+              trace_start: $trace_start, task_start: $task_start,
+              prompt: $prompt, offset: $offset, end_offset: $end_offset,
+              turn_index: $turn_index, workspace: $workspace,
+              transcript_path: $transcript_path}' 2>/dev/null)
+        if [ -n "$JOB" ]; then
+            enqueue_payload "$JOB"
+            log "INFO" "Queued recovery finalize for unfinalized turn: trace=$DANGLING_TRACE_ID session=$SESSION_ID"
+            OFFSET="$D_END"
+        fi
+    fi
+fi
+
 TURN_INDEX=$(get_session_state "$SESSION_ID" "turn_count")
 TURN_INDEX=$((${TURN_INDEX:-0} + 1))
 

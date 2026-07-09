@@ -233,26 +233,38 @@ _http_insert_span() {
     return 1
 }
 
-# Queue a span for background upload and return immediately. Hooks call this
-# instead of doing network I/O so they never block Claude Code. project_id may
-# be empty; the worker resolves $PROJECT by name and caches the id.
-insert_span() {
-    local project_id="$1" span_json="$2"
+# Append a job payload (already-built JSON) to the queue and return
+# immediately. Used for span uploads and recovery finalize jobs.
+enqueue_payload() {
+    local payload="$1"
     local qfile tmp
 
     mkdir -p "$QUEUE_DIR/pending" "$QUEUE_DIR/processing" 2>/dev/null || return 0
 
     qfile="$QUEUE_DIR/pending/$(get_time_nanos)-$$-$RANDOM.json"
     tmp="$qfile.tmp"
-    jq -cn \
-        --arg project_id "$project_id" \
-        --arg project_name "$PROJECT" \
-        --slurpfile span_f <(printf '%s\n' "$span_json") \
-        '{project_id: $project_id, project_name: $project_name, attempts: 0, span: $span_f[0]}' \
-        > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    printf '%s' "$payload" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
     mv -f "$tmp" "$qfile" 2>/dev/null || { rm -f "$tmp"; return 0; }
 
     ensure_worker_running
+    return 0
+}
+
+# Queue a span for background upload and return immediately. Hooks call this
+# instead of doing network I/O so they never block Claude Code. project_id may
+# be empty; the worker resolves $PROJECT by name and caches the id.
+insert_span() {
+    local project_id="$1" span_json="$2"
+    local payload
+
+    payload=$(jq -cn \
+        --arg project_id "$project_id" \
+        --arg project_name "$PROJECT" \
+        --slurpfile span_f <(printf '%s\n' "$span_json") \
+        '{type: "span", project_id: $project_id, project_name: $project_name, attempts: 0, span: $span_f[0]}' \
+        2>/dev/null) || return 0
+    [ -n "$payload" ] || return 0
+    enqueue_payload "$payload"
     return 0
 }
 

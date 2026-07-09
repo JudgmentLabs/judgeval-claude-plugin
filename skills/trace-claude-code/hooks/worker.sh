@@ -17,6 +17,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
+# shellcheck source=turn_trace_common.sh
+source "$SCRIPT_DIR/turn_trace_common.sh"
 
 PENDING="$QUEUE_DIR/pending"
 PROCESSING="$QUEUE_DIR/processing"
@@ -58,6 +60,45 @@ done
 
 debug "Queue worker $$ started"
 
+# Finalize a turn whose Stop hook was killed before completing. Runs the
+# normal transcript parse and finalization bounded to that turn's slice;
+# the spans it produces are enqueued and uploaded by this same loop. Runs
+# once per job — parsing is deterministic and local, so a failure here
+# would fail identically on retry.
+run_finalize_job() {
+    local job="$1"
+    TURN_SESSION_ID=$(jq -r '.session_id // empty' "$job")
+    TURN_TRACE_ID=$(jq -r '.trace_id // empty' "$job")
+    TURN_PROJECT_ID=$(jq -r '.project_id // empty' "$job")
+    TURN_ROOT_SPAN_ID=$(jq -r '.root_span_id // empty' "$job")
+    TURN_TASK_SPAN_ID=$(jq -r '.task_span_id // empty' "$job")
+    TURN_TRACE_START=$(jq -r '.trace_start // empty' "$job")
+    TURN_TASK_START=$(jq -r '.task_start // empty' "$job")
+    TURN_PROMPT=$(jq -r '.prompt // ""' "$job")
+    TURN_OFFSET=$(jq -r '.offset // 0' "$job")
+    TURN_END_OFFSET=$(jq -r '.end_offset // 0' "$job")
+    TURN_INDEX=$(jq -r '.turn_index // 1' "$job")
+    TURN_WORKSPACE=$(jq -r '.workspace // empty' "$job")
+    TURN_TRANSCRIPT_PATH=$(jq -r '.transcript_path // empty' "$job")
+    TURN_WORKSPACE_NAME=$(basename "$TURN_WORKSPACE" 2>/dev/null || echo "Claude Code")
+    TURN_FALLBACK_OUTPUT="Completed"
+    [ -z "$TURN_PROJECT_ID" ] && TURN_PROJECT_ID=$(get_cached_project_id)
+
+    if [ -z "$TURN_TRACE_ID" ] || [ -z "$TURN_ROOT_SPAN_ID" ] || [ -z "$TURN_TASK_SPAN_ID" ]; then
+        log "WARN" "Skipping malformed finalize job"
+        return 0
+    fi
+    if [ -z "$TURN_TRANSCRIPT_PATH" ] || [ ! -f "$TURN_TRANSCRIPT_PATH" ]; then
+        log "WARN" "Skipping finalize job: transcript missing"
+        return 0
+    fi
+
+    finalize_turn_trace
+    TURN_END_OFFSET=0
+    log "INFO" "Recovered unfinalized turn: trace=$TURN_TRACE_ID session=$TURN_SESSION_ID"
+    return 0
+}
+
 idle_since=$(date +%s)
 while true; do
     qfile=$(ls -1 "$PENDING" 2>/dev/null | head -1)
@@ -74,6 +115,13 @@ while true; do
     src="$PENDING/$qfile"
     work="$PROCESSING/$qfile"
     mv "$src" "$work" 2>/dev/null || continue
+
+    jtype=$(jq -r '.type // "span"' "$work" 2>/dev/null)
+    if [ "$jtype" = "finalize" ]; then
+        run_finalize_job "$work" || true
+        rm -f "$work" 2>/dev/null
+        continue
+    fi
 
     project_id=$(jq -r '.project_id // empty' "$work" 2>/dev/null)
     if [ -z "$project_id" ]; then

@@ -366,10 +366,19 @@ parse_turn_transcript() {
     local current_output="" current_model="" current_prompt_tokens=0 current_completion_tokens=0
     local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time="" current_request_id=""
     local conversation_history pending_tools="{}" current_tool_uses="[]" llm_output turn_start_aligned=""
+    TURN_LAST_RECORD_TS=""
     conversation_history=$(_turn_normalized_messages_through "$conv_file" "${TURN_OFFSET:-0}" "all")
 
+    # Slice of this turn's records. TURN_END_OFFSET bounds recovery finalizes
+    # of a past turn so records from later turns are not absorbed; 0 means
+    # read to end of file (the normal live-finalize path).
+    _turn_slice() {
+        awk -v s=$(( ${TURN_OFFSET:-0} + 1 )) -v e="${TURN_END_OFFSET:-0}" \
+            'NR >= s && (e == 0 || NR <= e)' "$conv_file"
+    }
+
     # requestId -> final usage + last-chunk timestamp for this turn's records
-    TURN_REQUEST_FINAL=$(tail -n +$(( ${TURN_OFFSET:-0} + 1 )) "$conv_file" | jq -cs '
+    TURN_REQUEST_FINAL=$(_turn_slice | jq -cs '
         [ .[] | select((.type // "") == "assistant" and (.requestId // "") != "")
           | {rid: .requestId, usage: (.message.usage // .usage // {}), ts: (.timestamp // "")} ]
         | group_by(.rid)
@@ -383,6 +392,13 @@ parse_turn_transcript() {
         local msg_type timestamp content content_type text usage
         msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
         timestamp=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
+
+        # Only assistant records mark the end of a turn: recovery slices can
+        # contain session-resume bookkeeping records (and the next prompt)
+        # written after the turn actually ended.
+        if [ "$msg_type" = "assistant" ] && [ -n "$timestamp" ] && [[ "$timestamp" > "${TURN_LAST_RECORD_TS:-}" ]]; then
+            TURN_LAST_RECORD_TS="$timestamp"
+        fi
 
         if [ -z "$turn_start_aligned" ] && [ -n "$timestamp" ]; then
             # Root/task spans are stamped with hook wall-clock time, which can
@@ -535,14 +551,18 @@ parse_turn_transcript() {
                 [ "$cr" != "null" ] && [ "$cr" -gt 0 ] 2>/dev/null && current_cache_read=$cr
             fi
         fi
-    done < <(tail -n +$(( ${TURN_OFFSET:-0} + 1 )) "$conv_file")
+    done < <(_turn_slice)
 
     llm_output=$(_turn_llm_output_text "$current_output" "$current_tool_uses")
     if [ -n "$llm_output" ]; then
         _turn_create_llm_span "$llm_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time" "$current_request_id"
     fi
 
-    TURN_NEW_OFFSET=$(count_file_lines "$conv_file")
+    if [ "${TURN_END_OFFSET:-0}" -gt 0 ] 2>/dev/null; then
+        TURN_NEW_OFFSET="$TURN_END_OFFSET"
+    else
+        TURN_NEW_OFFSET=$(count_file_lines "$conv_file")
+    fi
     return 0
 }
 
@@ -551,6 +571,11 @@ finalize_turn_trace() {
 
     local final_end final_output task_input_json task_output_json task_attrs task_span root_attrs root_span
     final_end=$(get_time_nanos)
+    if [ "${TURN_END_OFFSET:-0}" -gt 0 ] 2>/dev/null && [ -n "${TURN_LAST_RECORD_TS:-}" ]; then
+        # A recovery finalize runs long after the turn ended; end the trace at
+        # its last transcript record instead of the current wall clock.
+        final_end=$(iso_to_nanos "$TURN_LAST_RECORD_TS")
+    fi
     final_output="${TURN_LAST_OUTPUT:-${TURN_FALLBACK_OUTPUT:-}}"
 
     if [ "$TURN_LLM_CALLS" -eq 0 ] && [ -n "$final_output" ]; then
