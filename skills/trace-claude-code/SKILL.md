@@ -57,11 +57,10 @@ This will prompt you for:
 | Hook | Trigger | Action |
 |------|---------|--------|
 | `session_start.sh` | Session begins | Creates root trace span |
-| `user_prompt_submit.sh` | User sends prompt | Creates Turn span |
-| `post_tool_use.sh` | Tool completes | Tracks tool count |
-| `stop_hook.sh` | Response complete | Marks turn for finalization |
+| `user_prompt_submit.sh` | User sends prompt | Creates Turn span (and lazily creates the trace if SessionStart was missed) |
+| `stop_hook.sh` | Response complete | Parses the turn's transcript lines into LLM/tool spans, finalizes the Turn |
 | `subagent_stop.sh` | Subagent completes | Parses subagent transcript, creates nested spans |
-| `session_end.sh` | Session ends | Creates LLM/Tool spans, finalizes session |
+| `session_end.sh` | Session ends | Sweeps any unprocessed transcript tail, finalizes the session |
 
 ## Span Attributes
 

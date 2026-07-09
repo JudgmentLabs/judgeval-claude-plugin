@@ -48,10 +48,7 @@ ATTRIBUTES=$(build_otlp_attributes "$(jq -n \
 SPAN=$(build_otlp_span "$TRACE_ID" "$TASK_SPAN_ID" "$ROOT_SPAN_ID" "Task" "task" "$START_TIME" "$START_TIME" "$ATTRIBUTES" 0)
 insert_span "$PROJECT_ID" "$SPAN" || { log "ERROR" "Failed to create task span"; exit 0; }
 
-set_session_state_batch "$SESSION_ID" \
-    "current_task_span_id" "$TASK_SPAN_ID" \
-    "current_task_start" "$START_TIME" \
-    "current_task_input" "$PROMPT"
+set_session_state "$SESSION_ID" "current_task_span_id" "$TASK_SPAN_ID"
 
 log "INFO" "Task started: span=$TASK_SPAN_ID (session=$SESSION_ID)"
 exit 0

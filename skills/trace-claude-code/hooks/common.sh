@@ -6,6 +6,8 @@ export LOG_FILE="$HOME/.claude/state/judgeval_hook.log"
 export STATE_FILE="$HOME/.claude/state/judgeval_state.json"
 export LOCK_DIR="$HOME/.claude/state/judgeval.lock.d"
 export DEBUG="${JUDGEVAL_CC_DEBUG:-false}"
+DEBUG_ON=""
+[ "$(echo "$DEBUG" | tr '[:upper:]' '[:lower:]')" = "true" ] && DEBUG_ON=1
 export API_KEY="${JUDGMENT_API_KEY}"
 export ORG_ID="${JUDGMENT_ORG_ID}"
 export PROJECT="${JUDGEVAL_CC_PROJECT:-claude-code}"
@@ -17,9 +19,8 @@ mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$1] $2" >> "$LOG_FILE"; }
 
 debug() {
-    if [ "$(echo "$DEBUG" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
-        log "DEBUG" "$1"
-    fi
+    [ -n "$DEBUG_ON" ] && log "DEBUG" "$1"
+    return 0
 }
 
 tracing_enabled() {
@@ -100,22 +101,29 @@ save_state() {
     mv -f "$tmp_file" "$STATE_FILE"
 }
 
-get_state_value() {
-    load_state | jq -r ".$1 // empty"
-}
-
-set_state_value() {
-    with_lock _set_state_value_unsafe "$1" "$2"
-}
-
-_set_state_value_unsafe() {
-    local state
-    state=$(load_state)
-    save_state "$(echo "$state" | jq --arg k "$1" --arg v "$2" '.[$k] = $v')"
-}
-
 get_session_state() {
     load_state | jq -r ".sessions[\"$1\"].$2 // empty"
+}
+
+# get_session_fields SESSION_ID key... — one state read for N keys.
+# Output: values joined by the 0x1f unit separator, in argument order.
+get_session_fields() {
+    local sid="$1"; shift
+    load_state | jq -r --arg s "$sid" --args \
+        '(.sessions[$s] // {}) as $x | [$ARGS.positional[] as $k | ($x[$k] // "")] | join("\u001f")' "$@"
+}
+
+# clear_session_keys SESSION_ID key... — deletes keys instead of writing ""
+clear_session_keys() {
+    with_lock _clear_session_keys_unsafe "$@"
+}
+
+_clear_session_keys_unsafe() {
+    local sid="$1"; shift
+    local state
+    state=$(load_state)
+    save_state "$(echo "$state" | jq --arg s "$sid" --args \
+        'reduce $ARGS.positional[] as $k (.; del(.sessions[$s][$k]))' "$@")"
 }
 
 set_session_state() {
@@ -138,43 +146,37 @@ set_session_state_batch() {
 _set_session_state_batch_unsafe() {
     local session_id="$1"
     shift
-    local state key val
+    local state
     state=$(load_state)
-    while [ $# -ge 2 ]; do
-        key="$1"
-        val="$2"
-        state=$(echo "$state" | jq --arg s "$session_id" --arg k "$key" --arg v "$val" \
-            '.sessions[$s] = (.sessions[$s] // {}) | .sessions[$s][$k] = $v')
-        shift 2
-    done
-    save_state "$state"
+    save_state "$(echo "$state" | jq --arg s "$session_id" --args '
+        .sessions[$s] = (reduce range(0; ($ARGS.positional | length); 2) as $i (
+            (.sessions[$s] // {});
+            . + {($ARGS.positional[$i]): $ARGS.positional[$i + 1]}
+        ))' "$@")"
 }
 
 # API Operations
-_build_otlp_payload() {
-    local span_json="$1"
-    jq -n --arg service_name "$PROJECT" --argjson span "$span_json" '{
+
+# insert_spans_batch PROJECT_ID span_json... — all spans in ONE OTLP request.
+# The Stop hook can emit 10-20 spans per turn; sequential curls would add
+# seconds of latency before the user's next prompt.
+insert_spans_batch() {
+    local project_id="$1"; shift
+    [ $# -eq 0 ] && return 0
+    local otlp_payload resp http_code
+    [ -n "$DEBUG_ON" ] && debug "Inserting $# span(s)"
+    otlp_payload=$(printf '%s\n' "$@" | jq -cs --arg service_name "$PROJECT" '{
         resourceSpans: [{
             resource: { attributes: [
                 { key: "service.name", value: { stringValue: $service_name } },
                 { key: "telemetry.sdk.name", value: { stringValue: "judgeval" } },
                 { key: "telemetry.sdk.version", value: { stringValue: "1.0.0" } }
             ]},
-            scopeSpans: [{ scope: { name: "judgeval" }, spans: [$span] }]
+            scopeSpans: [{ scope: { name: "judgeval" }, spans: . }]
         }]
-    }'
-}
-
-insert_span() {
-    local project_id="$1" span_json="$2"
-    local otlp_payload resp http_code
-    
-    debug "Inserting span: $(echo "$span_json" | jq -c '.name' 2>/dev/null)"
-    
-    otlp_payload=$(_build_otlp_payload "$span_json")
-    
+    }')
     resp=$(curl -s -w "\n%{http_code}" \
-        --max-time 5 \
+        --max-time 10 \
         --connect-timeout 3 \
         -X POST \
         -H "Authorization: Bearer $API_KEY" \
@@ -183,16 +185,27 @@ insert_span() {
         -H "Content-Type: application/json" \
         -d "$otlp_payload" \
         "$API_URL/otel/v1/traces" 2>&1)
-    
     http_code=$(echo "$resp" | tail -1)
-    
     if [[ "$http_code" =~ ^20[012]$ ]]; then
-        debug "OTLP insert successful (HTTP $http_code)"
+        [ -n "$DEBUG_ON" ] && debug "OTLP insert successful (HTTP $http_code, $# spans)"
+        return 0
+    fi
+    log "WARN" "OTLP insert failed (HTTP $http_code, $# spans)"
+    return 1
+}
+
+# flush_span_batch PROJECT_ID — sends and clears the SPAN_BATCH array.
+flush_span_batch() {
+    insert_spans_batch "$1" "${SPAN_BATCH[@]}" || return 1
+    SPAN_BATCH=()
+    return 0
+}
+
+insert_span() {
+    if insert_spans_batch "$1" "$2"; then
         echo "success"
         return 0
     fi
-    
-    log "WARN" "OTLP insert failed (HTTP $http_code)"
     echo "failed"
     return 1
 }
@@ -278,6 +291,82 @@ session_history_file() {
     echo "$HOME/.claude/state/judgeval_history_$1.json"
 }
 
+workspace_display_name() {
+    local n
+    n=$(basename "${1:-.}" 2>/dev/null || echo "")
+    [ -z "$n" ] || [ "$n" = "." ] && n="Claude Code"
+    echo "$n"
+}
+
+# build_root_span_attrs SESSION_ID WORKSPACE [OUTPUT] [EXTRA_JSON]
+# Single builder for the session root span's attributes, used at creation
+# (ensure_trace) and finalization (session_end) so the finalize update can
+# never silently drop an attribute added at creation. EXTRA_JSON is a jq
+# object merged in (e.g. cross-trace link attributes).
+build_root_span_attrs() {
+    local session_id="$1" workspace="$2" output="$3" extra="$4"
+    [ -z "$extra" ] && extra="{}"
+    build_otlp_attributes "$(jq -n \
+        --arg input "Session: $(workspace_display_name "$workspace")" \
+        --arg output "$output" \
+        --arg session_id "$session_id" \
+        --arg workspace "${workspace:-}" \
+        --arg hostname "$(get_hostname)" \
+        --arg username "$(get_username)" \
+        --arg os "$(get_os)" \
+        --argjson extra "$extra" \
+        '{
+            "judgment.span_kind": "task",
+            "judgment.input": $input,
+            "judgment.session_id": $session_id,
+            "workspace": $workspace,
+            "hostname": $hostname,
+            "username": $username,
+            "os": $os,
+            "source": "claude-code"
+        } + (if $output == "" then {} else {"judgment.output": $output} end) + $extra')"
+}
+
+# Cross-trace linkage for resumed sessions.
+#
+# A Claude Code session keeps its session id across --resume, but each
+# resume starts a new trace. The platform navigates between related traces
+# via judgment.link.* span attributes (link_source_* renders as an "up"
+# reference to the trace this one came from). We remember each session'"'"'s
+# last completed trace so the next trace'"'"'s root can point back at it.
+
+record_completed_trace() {
+    with_lock _record_completed_trace_unsafe "$1" "$2" "$3"
+}
+
+_record_completed_trace_unsafe() {
+    local state now
+    now=$(date +%s)
+    state=$(load_state)
+    save_state "$(echo "$state" | jq --arg s "$1" --arg t "$2" --arg r "$3" --argjson now "$now" \
+        '.completed_sessions[$s] = {trace_id: $t, root_span_id: $r, ended_at: $now}
+         | .completed_sessions |= with_entries(select(.value.ended_at > ($now - 604800)))')"
+}
+
+# get_previous_trace SESSION_ID -> "trace_id<US>root_span_id" (empty if none)
+get_previous_trace() {
+    load_state | jq -r --arg s "$1" \
+        '.completed_sessions[$s] // empty | [.trace_id, .root_span_id] | join("\u001f")'
+}
+
+# previous_trace_link_attrs SESSION_ID -> jq object with judgment.link.source_*
+# pointing at the session'"'"'s previous trace root, or {}
+previous_trace_link_attrs() {
+    local prev_trace prev_root
+    IFS=$'\x1f' read -r prev_trace prev_root <<< "$(get_previous_trace "$1")"
+    if [ -n "$prev_trace" ] && [ -n "$prev_root" ]; then
+        jq -cn --arg t "$prev_trace" --arg r "$prev_root" \
+            '{"judgment.link.source_trace_id": $t, "judgment.link.source_span_id": $r}'
+    else
+        echo "{}"
+    fi
+}
+
 # ensure_trace SESSION_ID WORKSPACE [TRANSCRIPT_PATH]
 # Idempotent: creates the trace + root span for a session if it doesn't
 # exist yet, so any hook (not just SessionStart) can recover a session that
@@ -299,43 +388,24 @@ ensure_trace() {
         [ "$initial_offset" -gt 0 ] && debug "Trace starts at transcript line $initial_offset"
     fi
 
-    local project_id trace_id span_id workspace_name start_time attrs span
+    local project_id trace_id span_id start_time attrs span
     project_id=$(get_project_id "$PROJECT") || { log "ERROR" "Failed to get project"; return 1; }
 
     trace_id=$(generate_uuid | sed 's/-//g' | head -c 32)
     while [ ${#trace_id} -lt 32 ]; do trace_id="${trace_id}0"; done
     span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
-    workspace_name=$(basename "${workspace:-.}" 2>/dev/null || echo "Claude Code")
-    [ -z "$workspace_name" ] || [ "$workspace_name" = "." ] && workspace_name="Claude Code"
     start_time=$(get_time_nanos)
 
-    attrs=$(build_otlp_attributes "$(jq -n \
-        --arg span_kind "task" \
-        --arg input "Session: $workspace_name" \
-        --arg session_id "$session_id" \
-        --arg workspace "${workspace:-}" \
-        --arg hostname "$(get_hostname)" \
-        --arg username "$(get_username)" \
-        --arg os "$(get_os)" \
-        '{
-            "judgment.span_kind": $span_kind,
-            "judgment.input": $input,
-            "judgment.session_id": $session_id,
-            "workspace": $workspace,
-            "hostname": $hostname,
-            "username": $username,
-            "os": $os,
-            "source": "claude-code"
-        }')")
-
-    span=$(build_otlp_span "$trace_id" "$span_id" "" "Claude Code: $workspace_name" "task" "$start_time" "$start_time" "$attrs" 0)
+    local link_attrs
+    link_attrs=$(previous_trace_link_attrs "$session_id")
+    attrs=$(build_root_span_attrs "$session_id" "$workspace" "" "$link_attrs")
+    span=$(build_otlp_span "$trace_id" "$span_id" "" "Claude Code: $(workspace_display_name "$workspace")" "task" "$start_time" "$start_time" "$attrs" 0)
     insert_span_sync "$project_id" "$span" >/dev/null || { log "ERROR" "Failed to create session root"; return 1; }
 
     set_session_state_batch "$session_id" \
         "trace_id" "$trace_id" \
         "root_span_id" "$span_id" \
         "project_id" "$project_id" \
-        "workspace_name" "$workspace_name" \
         "workspace" "${workspace:-}" \
         "started" "$start_time" \
         "transcript_offset" "$initial_offset"
@@ -345,31 +415,17 @@ ensure_trace() {
     return 0
 }
 
+
 # Time Utilities
 get_time_nanos() {
-    if command -v python3 &>/dev/null; then
-        python3 -c "import time; print(int(time.time() * 1e9))"
-    else
-        echo "$(($(date +%s) * 1000000000))"
+    if [ -z "$_NOW_NANOS_MEMO" ]; then
+        if command -v python3 &>/dev/null; then
+            _NOW_NANOS_MEMO=$(python3 -c "import time; print(int(time.time() * 1e9))")
+        else
+            _NOW_NANOS_MEMO="$(($(date +%s) * 1000000000))"
+        fi
     fi
-}
-
-iso_to_nanos() {
-    local ts="$1"
-    [ -z "$ts" ] && { get_time_nanos; return; }
-    
-    if command -v python3 &>/dev/null; then
-        local result
-        result=$(python3 -c "
-from datetime import datetime
-try:
-    ts = '${ts}'.replace('Z', '+00:00')
-    print(int(datetime.fromisoformat(ts).timestamp() * 1e9))
-except: print('')
-" 2>/dev/null)
-        [ -n "$result" ] && { echo "$result"; return; }
-    fi
-    get_time_nanos
+    echo "$_NOW_NANOS_MEMO"
 }
 
 detect_provider() {

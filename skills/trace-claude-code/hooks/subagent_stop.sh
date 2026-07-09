@@ -2,27 +2,28 @@
 ###
 # SubagentStop Hook - Creates spans for subagent execution
 #
-# When a subagent (Task tool) completes, this hook:
-# 1. Creates a container span for the subagent
-# 2. Parses the subagent's transcript for LLM/tool spans
-# 3. Links everything to the parent trace
+# Creates a container span for the completed subagent and parses its
+# transcript into LLM/tool spans via the shared transcript parser (offset 0,
+# sidechain lines included, subagent_id stamped on every span). All spans go
+# out in one batched OTLP request.
 ###
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
+# shellcheck source=transcript_parser.sh
+source "$SCRIPT_DIR/transcript_parser.sh"
 
 debug "SubagentStop hook triggered"
 tracing_enabled || { debug "Tracing disabled"; exit 0; }
 check_requirements || exit 0
 
 INPUT=$(cat)
-debug "SubagentStop input: $(echo "$INPUT" | jq -c '.' 2>/dev/null | head -c 1000)"
+[ -n "$DEBUG_ON" ] && debug "SubagentStop input: $(echo "$INPUT" | jq -c '.' 2>/dev/null | head -c 1000)"
 
 echo "$INPUT" | jq -e '.' >/dev/null 2>&1 || { debug "Invalid JSON"; exit 0; }
 
-# Extract subagent info from hook input
 SUBAGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // .subagent_id // empty' 2>/dev/null)
 SUBAGENT_TRANSCRIPT=$(echo "$INPUT" | jq -r '.agent_transcript_path // empty' 2>/dev/null)
 TASK_DESCRIPTION=$(echo "$INPUT" | jq -r '.task // .description // empty' 2>/dev/null)
@@ -31,262 +32,93 @@ PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // 
 [ -z "$PARENT_SESSION_ID" ] && { debug "No session ID"; exit 0; }
 
 # Get parent trace context (keyed by the parent session)
-TRACE_ID=$(get_session_state "$PARENT_SESSION_ID" "trace_id")
+IFS=$'\x1f' read -r TRACE_ID PROJECT_ID ROOT_SPAN_ID PARENT_TASK_SPAN_ID \
+    <<< "$(get_session_fields "$PARENT_SESSION_ID" trace_id project_id root_span_id current_task_span_id)"
+
 [ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
-
-PARENT_TASK_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "current_task_span_id")
-PROJECT_ID=$(get_session_state "$PARENT_SESSION_ID" "project_id")
-ROOT_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "root_span_id")
-
-[ -z "$PROJECT_ID" ] && { debug "No project ID"; exit 0; }
-[ -z "$ROOT_SPAN_ID" ] && { debug "No root span"; exit 0; }
+[ -z "$PROJECT_ID" ] || [ -z "$ROOT_SPAN_ID" ] && { debug "No trace/project"; exit 0; }
 
 # Use task span as parent if available, otherwise root
 PARENT_SPAN_ID="${PARENT_TASK_SPAN_ID:-$ROOT_SPAN_ID}"
-
-# Generate subagent container span
 SUBAGENT_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
-START_TIME=$(get_time_nanos)
 
 # The provided agent_transcript_path may not be written yet when this hook
-# fires (observed live: the path referenced a subagents/ dir that did not
-# exist). Wait briefly for it before falling back to a search.
-if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ ! -f "$SUBAGENT_TRANSCRIPT" ]; then
-    for _ in 1 2 3 4; do
-        sleep 0.5
-        [ -f "$SUBAGENT_TRANSCRIPT" ] && break
-    done
-    [ -f "$SUBAGENT_TRANSCRIPT" ] || debug "Provided agent transcript never appeared: $SUBAGENT_TRANSCRIPT"
-fi
-if [ -z "$SUBAGENT_TRANSCRIPT" ] || [ ! -f "$SUBAGENT_TRANSCRIPT" ]; then
+# fires (observed live). Back off briefly, checking fallback locations
+# between waits so a found file short-circuits the wait.
+find_subagent_transcript() {
+    [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ] && return 0
     if [ -n "$SUBAGENT_ID" ]; then
+        local pattern FOUND
         for pattern in \
             "$HOME/.claude/projects/*/*/subagents/agent-${SUBAGENT_ID}.jsonl" \
             "$HOME/.claude/projects/*/agent-${SUBAGENT_ID}.jsonl" \
-            "$HOME/.claude/projects/*/${SUBAGENT_ID}.jsonl" \
-            "$HOME/.claude/state/agent-${SUBAGENT_ID}.jsonl"; do
+            "$HOME/.claude/projects/*/${SUBAGENT_ID}.jsonl"; do
             FOUND=$(find $pattern -type f 2>/dev/null | head -1)
             if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
                 SUBAGENT_TRANSCRIPT="$FOUND"
                 debug "Found subagent transcript: $SUBAGENT_TRANSCRIPT"
-                break
+                return 0
             fi
         done
     fi
-fi
+    return 1
+}
+for wait in 0 0.1 0.2 0.4 0.8; do
+    [ "$wait" != "0" ] && sleep "$wait"
+    find_subagent_transcript && break
+done
 
-# Track subagent stats
-LLM_CALLS=0
-TOOL_CALLS=0
-SUBAGENT_OUTPUT=""
-
-# Parse transcript for LLM and tool spans
+SPAN_BATCH=()
+PARSE_LLM_CALLS=0
+PARSE_TOOL_CALLS=0
+PARSE_LAST_OUTPUT=""
+PARSE_FIRST_TS_NANOS=""
 if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
-    debug "Parsing subagent transcript: $SUBAGENT_TRANSCRIPT"
-    
-    CURRENT_OUTPUT=""
-    CURRENT_MODEL=""
-    CURRENT_PROMPT_TOKENS=0
-    CURRENT_COMPLETION_TOKENS=0
-    LLM_START_TIME=""
-    LLM_END_TIME=""
-    PENDING_TOOLS="{}"
-    FIRST_TS_NANOS=""
-
-    create_subagent_llm_span() {
-        local output="$1" model="$2" prompt="$3" completion="$4"
-        local start_time="$5" end_time="$6"
-        [ -z "$output" ] && return
-        
-        local span_id provider input_json output_json attrs span
-        span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
-        provider=$(detect_provider "$model")
-        
-        input_json=$(jq -n --arg d "$TASK_DESCRIPTION" '[{role: "user", content: $d}]' | jq -c '.' | jq -Rs '.')
-        output_json=$(jq -n --arg c "$output" '[{role: "assistant", content: $c}]' | jq -c '.' | jq -Rs '.')
-        
-        attrs=$(build_otlp_attributes "$(jq -n \
-            --arg span_kind "llm" --argjson input "$input_json" --argjson output "$output_json" \
-            --arg model "${model:-claude}" --arg provider "$provider" \
-            --argjson prompt "$prompt" --argjson completion "$completion" \
-            '{
-              "judgment.span_kind": $span_kind,
-              "judgment.input": $input,
-              "judgment.output": $output,
-              "judgment.llm.provider": $provider,
-              "judgment.llm.model": $model,
-              "judgment.usage.non_cached_input_tokens": $prompt,
-              "judgment.usage.output_tokens": $completion,
-              "subagent_id": "'"$SUBAGENT_ID"'",
-              "judgment.session_id": "'"$PARENT_SESSION_ID"'"
-            }')")
-        
-        span=$(build_otlp_span "$TRACE_ID" "$span_id" "$SUBAGENT_SPAN_ID" "${model:-anthropic.messages.create}" "llm" "$start_time" "$end_time" "$attrs" 20)
-        
-        if insert_span "$PROJECT_ID" "$span" >/dev/null; then
-            LLM_CALLS=$((LLM_CALLS + 1))
-            debug "Subagent LLM span: $model"
-        fi
-    }
-
-    create_subagent_tool_span() {
-        local tool_name="$1" tool_input="$2" tool_output="$3" start_time="$4" end_time="$5"
-        [ -z "$tool_name" ] && return
-        
-        local span_id input_json output_json attrs span
-        span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
-        input_json=$(echo "$tool_input" | jq -c '.' 2>/dev/null | jq -Rs '.')
-        output_json=$(echo "$tool_output" | jq -Rs '.')
-        
-        attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" --arg subagent_id "$SUBAGENT_ID" \
-            '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "subagent_id": $subagent_id, "judgment.session_id": "'"$PARENT_SESSION_ID"'"}')")
-        
-        span=$(build_otlp_span "$TRACE_ID" "$span_id" "$SUBAGENT_SPAN_ID" "$tool_name" "tool" "$start_time" "$end_time" "$attrs" 20)
-        
-        if insert_span "$PROJECT_ID" "$span" >/dev/null; then
-            TOOL_CALLS=$((TOOL_CALLS + 1))
-            debug "Subagent tool span: $tool_name"
-        fi
-    }
-
-    # Parse the subagent transcript (same logic as session_end.sh)
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        
-        MSG_TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
-        TIMESTAMP=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
-        if [ -z "$FIRST_TS_NANOS" ] && [ -n "$TIMESTAMP" ]; then
-            FIRST_TS_NANOS=$(iso_to_nanos "$TIMESTAMP")
-        fi
-        
-        if [ "$MSG_TYPE" = "user" ]; then
-            CONTENT=$(echo "$line" | jq -c '.message.content // empty' 2>/dev/null)
-            CONTENT_TYPE=""
-            if echo "$CONTENT" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                CONTENT_TYPE=$(echo "$CONTENT" | jq -r '.[0].type // empty' 2>/dev/null)
-            fi
-            
-            if [ "$CONTENT_TYPE" = "tool_result" ]; then
-                # Flush pending LLM span
-                if [ -n "$CURRENT_OUTPUT" ]; then
-                    create_subagent_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$LLM_START_TIME" "$LLM_END_TIME"
-                    CURRENT_OUTPUT=""
-                fi
-                LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
-                
-                # Process tool results
-                TOOL_USE_RESULT=$(echo "$line" | jq -c '.toolUseResult // empty' 2>/dev/null)
-                
-                while IFS= read -r TOOL_RESULT; do
-                    [ -z "$TOOL_RESULT" ] && continue
-                    TOOL_USE_ID=$(echo "$TOOL_RESULT" | jq -r '.tool_use_id // empty')
-                    
-                    if [ -n "$TOOL_USE_RESULT" ] && [ "$TOOL_USE_RESULT" != "null" ]; then
-                        TOOL_OUT=$(echo "$TOOL_USE_RESULT" | jq -r '.text // .content // "completed"' 2>/dev/null)
-                    else
-                        TOOL_OUT=$(echo "$TOOL_RESULT" | jq -r '.content // "result"')
-                    fi
-                    
-                    if [ -n "$TOOL_USE_ID" ]; then
-                        PENDING=$(echo "$PENDING_TOOLS" | jq -r ".\"$TOOL_USE_ID\" // empty")
-                        if [ -n "$PENDING" ] && [ "$PENDING" != "null" ]; then
-                            P_NAME=$(echo "$PENDING" | jq -r '.name')
-                            P_INPUT=$(echo "$PENDING" | jq -r '.input')
-                            P_START=$(echo "$PENDING" | jq -r '.start')
-                            END_NANOS=$(iso_to_nanos "$TIMESTAMP")
-                            create_subagent_tool_span "$P_NAME" "$P_INPUT" "$TOOL_OUT" "$P_START" "$END_NANOS"
-                            PENDING_TOOLS=$(echo "$PENDING_TOOLS" | jq "del(.\"$TOOL_USE_ID\")")
-                        fi
-                    fi
-                done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null)
-                
-                CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0
-            else
-                # Regular user message - flush pending LLM span
-                if [ -n "$CURRENT_OUTPUT" ]; then
-                    create_subagent_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$LLM_START_TIME" "$LLM_END_TIME"
-                fi
-                LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
-                CURRENT_OUTPUT=""; CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0
-            fi
-            
-        elif [ "$MSG_TYPE" = "assistant" ]; then
-            LLM_END_TIME=$(iso_to_nanos "$TIMESTAMP")
-            
-            # Track tool_use blocks
-            if echo "$line" | jq -e '.message.content | type == "array"' >/dev/null 2>&1; then
-                while IFS= read -r TOOL_USE; do
-                    [ -z "$TOOL_USE" ] && continue
-                    TOOL_ID=$(echo "$TOOL_USE" | jq -r '.id // empty')
-                    TOOL_NAME=$(echo "$TOOL_USE" | jq -r '.name // empty')
-                    TOOL_INPUT=$(echo "$TOOL_USE" | jq -c '.input // {}')
-                    if [ -n "$TOOL_ID" ] && [ -n "$TOOL_NAME" ]; then
-                        PENDING_TOOLS=$(echo "$PENDING_TOOLS" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --arg input "$TOOL_INPUT" --arg start "$(iso_to_nanos "$TIMESTAMP")" \
-                            '.[$id] = {name: $name, input: $input, start: $start}')
-                    fi
-                done < <(echo "$line" | jq -c '.message.content[] | select(.type == "tool_use")' 2>/dev/null)
-            fi
-            
-            # Extract text
-            TEXT=$(echo "$line" | jq -r '.message.content | if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null)
-            [ -n "$TEXT" ] && CURRENT_OUTPUT="${CURRENT_OUTPUT:+$CURRENT_OUTPUT$'\n'}$TEXT"
-            
-            # Extract model and usage
-            MODEL=$(echo "$line" | jq -r '.message.model // .model // empty' 2>/dev/null)
-            [ -n "$MODEL" ] && CURRENT_MODEL="$MODEL"
-            
-            # Claude Code repeats the same cumulative usage on every assistant content block
-            # within a single API call, so use the latest values (replace) instead of accumulating
-            USAGE=$(echo "$line" | jq -c '.message.usage // .usage // {}' 2>/dev/null)
-            if [ -n "$USAGE" ] && [ "$USAGE" != "{}" ]; then
-                INP=$(echo "$USAGE" | jq -r '.input_tokens // 0')
-                [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$INP
-                OUT=$(echo "$USAGE" | jq -r '.output_tokens // 0')
-                [ "$OUT" != "null" ] && [ "$OUT" -gt 0 ] 2>/dev/null && CURRENT_COMPLETION_TOKENS=$OUT
-            fi
-            
-            # Save last output for subagent summary
-            SUBAGENT_OUTPUT="$CURRENT_OUTPUT"
-        fi
-    done < "$SUBAGENT_TRANSCRIPT"
-    
-    # Flush final LLM span
-    [ -n "$CURRENT_OUTPUT" ] && create_subagent_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$LLM_START_TIME" "$LLM_END_TIME"
+    PARSE_FILE="$SUBAGENT_TRANSCRIPT"
+    PARSE_OFFSET=0
+    PARSE_TRACE_ID="$TRACE_ID"
+    PARSE_PROJECT_ID="$PROJECT_ID"
+    PARSE_SESSION_ID="$PARENT_SESSION_ID"
+    PARSE_PARENT_SPAN_ID="$SUBAGENT_SPAN_ID"
+    PARSE_HISTORY_FILE=""
+    PARSE_INCLUDE_SIDECHAIN=1
+    PARSE_EXTRA_ATTRS=$(jq -cn --arg id "${SUBAGENT_ID:-unknown}" '{subagent_id: $id}')
+    parse_transcript_chunk
+    PARSE_EXTRA_ATTRS=""
+    PARSE_INCLUDE_SIDECHAIN=0
+else
+    debug "No subagent transcript available"
 fi
 
-# Create the subagent container span. Prefer real data over placeholders:
-# last_assistant_message from the hook input when the transcript was
-# unavailable, and the transcript's own first timestamp for the start.
+# Container span: prefer real data over placeholders — transcript timestamps
+# for the window, last assistant message when the transcript was unavailable.
 END_TIME=$(get_time_nanos)
-[ -z "$SUBAGENT_OUTPUT" ] && SUBAGENT_OUTPUT="$LAST_ASSISTANT"
-[ -n "$FIRST_TS_NANOS" ] && [ "$FIRST_TS_NANOS" -gt 0 ] 2>/dev/null && START_TIME="$FIRST_TS_NANOS"
-TASK_INPUT_JSON=$(echo "${TASK_DESCRIPTION:-Subagent task}" | jq -Rs '.')
-SUBAGENT_OUTPUT_JSON=$(echo "${SUBAGENT_OUTPUT:-Completed}" | jq -Rs '.')
+START_TIME="${PARSE_FIRST_TS_NANOS:-$END_TIME}"
+SUBAGENT_OUTPUT="${PARSE_LAST_OUTPUT:-${LAST_ASSISTANT:-Completed}}"
 
 SUBAGENT_ATTRS=$(build_otlp_attributes "$(jq -n \
-    --arg span_kind "task" \
-    --argjson input "$TASK_INPUT_JSON" \
-    --argjson output "$SUBAGENT_OUTPUT_JSON" \
+    --arg input "${TASK_DESCRIPTION:-Subagent task}" \
+    --arg output "$SUBAGENT_OUTPUT" \
     --arg subagent_id "${SUBAGENT_ID:-unknown}" \
-    --argjson llm_calls "$LLM_CALLS" \
-    --argjson tool_calls "$TOOL_CALLS" \
+    --argjson llm_calls "$PARSE_LLM_CALLS" \
+    --argjson tool_calls "$PARSE_TOOL_CALLS" \
     --arg session_id "$PARENT_SESSION_ID" \
     '{
-        "judgment.span_kind": $span_kind,
-        "judgment.session_id": $session_id,
+        "judgment.span_kind": "task",
         "judgment.input": $input,
         "judgment.output": $output,
         "subagent_id": $subagent_id,
         "llm_call_count": $llm_calls,
-        "tool_count": $tool_calls
+        "tool_count": $tool_calls,
+        "judgment.session_id": $session_id
     }')")
+SUBAGENT_SPAN=$(build_otlp_span "$TRACE_ID" "$SUBAGENT_SPAN_ID" "$PARENT_SPAN_ID" "Subagent: ${SUBAGENT_ID:-task}" "task" "$START_TIME" "$END_TIME" "$SUBAGENT_ATTRS" 20)
+SPAN_BATCH+=("$SUBAGENT_SPAN")
 
-SUBAGENT_SPAN=$(build_otlp_span "$TRACE_ID" "$SUBAGENT_SPAN_ID" "$PARENT_SPAN_ID" "Subagent: ${SUBAGENT_ID:-task}" "task" "$START_TIME" "$END_TIME" "$SUBAGENT_ATTRS" 0)
-
-if insert_span "$PROJECT_ID" "$SUBAGENT_SPAN"; then
-    log "INFO" "Subagent traced: ${SUBAGENT_ID:-unknown} (llm=$LLM_CALLS, tools=$TOOL_CALLS)"
+if flush_span_batch "$PROJECT_ID"; then
+    log "INFO" "Subagent traced: ${SUBAGENT_ID:-unknown} (llm=$PARSE_LLM_CALLS, tools=$PARSE_TOOL_CALLS)"
 else
-    log "ERROR" "Failed to create subagent span"
+    log "ERROR" "Failed to send subagent spans"
 fi
 
 exit 0
