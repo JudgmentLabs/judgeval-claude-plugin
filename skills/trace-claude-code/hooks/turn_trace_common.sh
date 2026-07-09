@@ -340,7 +340,7 @@ parse_turn_transcript() {
 
     local current_output="" current_model="" current_prompt_tokens=0 current_completion_tokens=0
     local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time="" current_request_id=""
-    local conversation_history pending_tools="{}" current_tool_uses="[]" llm_output
+    local conversation_history pending_tools="{}" current_tool_uses="[]" llm_output turn_start_aligned=""
     conversation_history=$(_turn_normalized_messages_through "$conv_file" "${TURN_OFFSET:-0}" "all")
 
     while IFS= read -r line; do
@@ -349,6 +349,24 @@ parse_turn_transcript() {
         local msg_type timestamp content content_type text usage
         msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
         timestamp=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
+
+        if [ -z "$turn_start_aligned" ] && [ -n "$timestamp" ]; then
+            # Root/task spans are stamped with hook wall-clock time, which can
+            # trail the turn's first transcript record; pull the starts back so
+            # child spans (timed from transcript records) never begin before
+            # their parents.
+            turn_start_aligned=1
+            local first_record_nanos
+            first_record_nanos=$(iso_to_nanos "$timestamp")
+            if [ -n "$first_record_nanos" ]; then
+                if [ -n "$TURN_TRACE_START" ] && [ "$first_record_nanos" -lt "$TURN_TRACE_START" ] 2>/dev/null; then
+                    TURN_TRACE_START="$first_record_nanos"
+                fi
+                if [ -n "$TURN_TASK_START" ] && [ "$first_record_nanos" -lt "$TURN_TASK_START" ] 2>/dev/null; then
+                    TURN_TASK_START="$first_record_nanos"
+                fi
+            fi
+        fi
 
         if [ "$msg_type" = "user" ]; then
             content=$(echo "$line" | jq -c '.message.content // empty' 2>/dev/null)
