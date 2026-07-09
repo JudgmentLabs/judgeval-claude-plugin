@@ -271,6 +271,25 @@ _turn_create_tool_span() {
     if insert_span "$TURN_PROJECT_ID" "$span" >/dev/null; then
         TURN_TOOL_CALLS=$((TURN_TOOL_CALLS + 1))
         log "INFO" "Tool span: $tool_name"
+        if [ "$tool_name" = "Agent" ]; then
+            local subagent_task_id subagent_description subagent_key
+            subagent_task_id=$(echo "$tool_output" | jq -r 'if type == "object" then .agentId // .agent_id // empty else empty end' 2>/dev/null)
+            subagent_description=$(echo "$tool_input" | jq -r 'if type == "object" then .description // empty else empty end' 2>/dev/null)
+            if [ -n "$subagent_task_id" ]; then
+                subagent_key="subagent:$subagent_task_id"
+                set_session_state_batch "$subagent_key" \
+                    "parent_session_id" "$TURN_SESSION_ID" \
+                    "trace_id" "$TURN_TRACE_ID" \
+                    "project_id" "$TURN_PROJECT_ID" \
+                    "root_span_id" "$TURN_ROOT_SPAN_ID" \
+                    "task_span_id" "$TURN_TASK_SPAN_ID" \
+                    "tool_span_id" "$span_id" \
+                    "turn_index" "${TURN_INDEX:-1}" \
+                    "workspace" "${TURN_WORKSPACE:-}" \
+                    "description" "${subagent_description:-$tool_name}"
+                debug "Mapped subagent task $subagent_task_id to trace $TURN_TRACE_ID"
+            fi
+        fi
     fi
 }
 

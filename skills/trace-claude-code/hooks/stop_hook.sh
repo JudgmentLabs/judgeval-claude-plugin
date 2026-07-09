@@ -27,6 +27,13 @@ if [ -z "$SESSION_ID" ] && [ -n "$TRANSCRIPT_PATH" ]; then
 fi
 [ -z "$SESSION_ID" ] && { debug "No session ID"; exit 0; }
 
+SKIP_TRACE_REASON=$(get_session_state "$SESSION_ID" "skip_trace_reason")
+if [ -n "$SKIP_TRACE_REASON" ]; then
+    debug "Skipping Stop hook for session $SESSION_ID: $SKIP_TRACE_REASON"
+    clear_session_keys "$SESSION_ID" skip_trace_reason parent_session_id parent_trace_id
+    exit 0
+fi
+
 IFS=$'\x1f' read -r TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID TRACE_START TASK_START PROMPT OFFSET TURN_INDEX WORKSPACE STATE_TRANSCRIPT \
     <<< "$(get_session_fields "$SESSION_ID" active_trace_id project_id active_root_span_id active_task_span_id active_trace_start active_task_start active_prompt active_transcript_offset turn_count workspace transcript_path)"
 
