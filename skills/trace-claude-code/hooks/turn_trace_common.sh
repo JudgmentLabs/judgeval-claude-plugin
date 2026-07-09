@@ -25,12 +25,140 @@ _turn_extract_text_content() {
     fi
 }
 
+_turn_normalized_messages() {
+    local file="$1" start_line="${2:-0}" end_line="${3:-0}" mode="${4:-all}"
+    [ -n "$file" ] && [ -f "$file" ] || { echo "[]"; return; }
+
+    jq -R -s \
+        --argjson start "$start_line" \
+        --argjson end "$end_line" \
+        --arg mode "$mode" '
+        def content_items:
+          if . == null then []
+          elif type == "array" then
+            map(
+              if .type == "text" then {type: "text", text: (.text // "")}
+              elif .type == "tool_use" then {type: "tool_use", id: (.id // ""), name: (.name // ""), input: (.input // {})}
+              elif .type == "tool_result" then {type: "tool_result", tool_use_id: (.tool_use_id // ""), content: (.content // "")}
+              else .
+              end
+            )
+          elif type == "string" then [{type: "text", text: .}]
+          else [{type: "json", value: .}]
+          end;
+        def text_from_items($items):
+          [$items[]? | select(.type == "text" and ((.text // "") | length) > 0) | .text] | join("\n");
+        def normalize:
+          .rec as $r
+          | ($r.message.content | content_items) as $items
+          | if $r.type == "user" then
+              {
+                role: (if (($items[0].type // "") == "tool_result") then "tool" else "user" end),
+                timestamp: ($r.timestamp // ""),
+                content: $items,
+                text: text_from_items($items),
+                tool_result: ($r.toolUseResult // null),
+                uuid: ($r.uuid // ""),
+                line: .line
+              }
+            elif $r.type == "assistant" then
+              {
+                role: "assistant",
+                timestamp: ($r.timestamp // ""),
+                content: $items,
+                text: text_from_items($items),
+                tool_uses: [$items[]? | select(.type == "tool_use")],
+                model: ($r.message.model // $r.model // ""),
+                uuid: ($r.uuid // ""),
+                line: .line
+              }
+            elif $r.type == "system" then
+              {
+                role: "system",
+                timestamp: ($r.timestamp // ""),
+                content: $items,
+                text: text_from_items($items),
+                uuid: ($r.uuid // ""),
+                line: .line
+              }
+            else empty end;
+        split("\n")
+        | to_entries
+        | map(
+            select(.value | length > 0)
+            | {line: (.key + 1), rec: (.value | fromjson?)}
+            | select(.rec != null)
+            | select(.line > $start and (($end == 0) or (.line <= $end)))
+            | normalize
+            | select(
+                if $mode == "input" then
+                  (.role != "assistant") or (((.tool_uses // []) | length) > 0)
+                elif $mode == "assistant" then
+                  (.role == "assistant") and (((.text // "") | length) > 0)
+                else true end
+              )
+          )
+        ' "$file"
+}
+
+_turn_context_payload() {
+    local messages_json="$1" current_output="${2:-}" include_output="${3:-false}"
+    jq -cn \
+        --argjson messages "$messages_json" \
+        --arg session_id "$TURN_SESSION_ID" \
+        --arg trace_id "$TURN_TRACE_ID" \
+        --arg root_span_id "$TURN_ROOT_SPAN_ID" \
+        --arg task_span_id "$TURN_TASK_SPAN_ID" \
+        --argjson turn_index "${TURN_INDEX:-1}" \
+        --arg workspace "${TURN_WORKSPACE:-}" \
+        --arg current_prompt "${TURN_PROMPT:-}" \
+        --arg output "$current_output" \
+        --arg include_output "$include_output" \
+        '{
+          metadata: {
+            session_id: $session_id,
+            trace_id: $trace_id,
+            root_span_id: $root_span_id,
+            task_span_id: $task_span_id,
+            turn_index: $turn_index,
+            workspace: $workspace,
+            source: "claude-code"
+          },
+          current_user_prompt: $current_prompt,
+          messages: $messages
+        }
+        | if $include_output == "true" then . + {assistant_output: $output} else . end'
+}
+
+_turn_build_context_payloads() {
+    local final_output="${1:-}"
+    local prior_messages current_input_messages current_output_messages all_messages input_messages output_messages
+
+    if [ -n "$TURN_TRANSCRIPT_PATH" ] && [ -f "$TURN_TRANSCRIPT_PATH" ]; then
+        prior_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" 0 "${TURN_OFFSET:-0}" "all")
+        current_input_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" "${TURN_OFFSET:-0}" "${TURN_NEW_OFFSET:-0}" "input")
+        current_output_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" "${TURN_OFFSET:-0}" "${TURN_NEW_OFFSET:-0}" "assistant")
+        all_messages=$(_turn_normalized_messages "$TURN_TRANSCRIPT_PATH" 0 "${TURN_NEW_OFFSET:-0}" "all")
+    else
+        prior_messages="[]"
+        current_input_messages=$(jq -cn --arg p "${TURN_PROMPT:-}" '[{role: "user", content: [{type: "text", text: $p}], text: $p}]')
+        current_output_messages="[]"
+        all_messages="$current_input_messages"
+    fi
+
+    input_messages=$(jq -cn --argjson prior "$prior_messages" --argjson current "$current_input_messages" '$prior + $current')
+    output_messages="$all_messages"
+
+    TURN_CONTEXT_INPUT_JSON=$(_turn_context_payload "$input_messages" "" "false")
+    TURN_CONTEXT_OUTPUT_JSON=$(_turn_context_payload "$output_messages" "$final_output" "true")
+}
+
 _turn_create_llm_span() {
     local output="$1" model="$2" prompt_tokens="$3" completion_tokens="$4" history="$5"
     local cache_create="${6:-0}" cache_read="${7:-0}" start_time="$8" end_time="$9"
     [ -z "$output" ] && return
 
-    local span_id span_start span_end input_json output_json attrs span provider usage_meta history_json
+    local span_id span_start span_end input_json output_json attrs span provider usage_meta history_json input_payload output_payload output_messages_json
     span_id=$(generate_span_id)
     span_end="${end_time:-$(get_time_nanos)}"
     span_start="${start_time:-${TURN_TASK_START:-$span_end}}"
@@ -40,8 +168,15 @@ _turn_create_llm_span() {
 
     provider=$(detect_provider "$model")
     history_json=$(_turn_history_for_llm "$history")
-    input_json=$(echo "$history_json" | jq -c '.' | _turn_json_string)
-    output_json=$(jq -n --arg c "$output" '[{role: "assistant", content: $c}]' | jq -c '.' | _turn_json_string)
+    input_payload=$(_turn_context_payload "$history_json" "" "false")
+    output_messages_json=$(jq -cn \
+        --argjson history "$history_json" \
+        --arg c "$output" \
+        --arg ts "$span_end" \
+        '$history + [{role: "assistant", timestamp_nanos: $ts, content: [{type: "text", text: $c}], text: $c}]')
+    output_payload=$(_turn_context_payload "$output_messages_json" "$output" "true")
+    input_json=$(echo "$input_payload" | jq -c '.' | _turn_json_string)
+    output_json=$(echo "$output_payload" | jq -c '.' | _turn_json_string)
     usage_meta=$(jq -n \
         --argjson inp "${prompt_tokens:-0}" \
         --argjson out "${completion_tokens:-0}" \
@@ -136,7 +271,8 @@ parse_turn_transcript() {
 
     local current_output="" current_model="" current_prompt_tokens=0 current_completion_tokens=0
     local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time=""
-    local conversation_history="[]" pending_tools="{}"
+    local conversation_history pending_tools="{}"
+    conversation_history=$(_turn_normalized_messages "$conv_file" 0 "${TURN_OFFSET:-0}" "all")
 
     while IFS= read -r line; do
         [ -z "$line" ] && continue
@@ -155,7 +291,7 @@ parse_turn_transcript() {
             if [ "$content_type" = "tool_result" ]; then
                 if [ -n "$current_output" ]; then
                     _turn_create_llm_span "$current_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
-                    conversation_history=$(echo "$conversation_history" | jq --arg c "$current_output" '. += [{role: "assistant", content: $c}]')
+                    conversation_history=$(echo "$conversation_history" | jq --arg c "$current_output" '. += [{role: "assistant", content: [{type: "text", text: $c}], text: $c}]')
                     current_output=""
                 fi
                 llm_start_time=$(iso_to_nanos "$timestamp")
@@ -196,6 +332,11 @@ parse_turn_transcript() {
                             pending_tools=$(echo "$pending_tools" | jq "del(.\"$tool_use_id\")")
                         fi
                     fi
+                    conversation_history=$(echo "$conversation_history" | jq \
+                        --arg ts "$timestamp" \
+                        --arg id "$tool_use_id" \
+                        --arg c "$tool_out" \
+                        '. += [{role: "tool", timestamp: $ts, tool_use_id: $id, content: [{type: "tool_result", content: $c}], text: $c}]')
                 done < <(echo "$content" | jq -c '.[]' 2>/dev/null)
 
                 current_model=""
@@ -206,12 +347,12 @@ parse_turn_transcript() {
             else
                 if [ -n "$current_output" ]; then
                     _turn_create_llm_span "$current_output" "$current_model" "$current_prompt_tokens" "$current_completion_tokens" "$conversation_history" "$current_cache_creation" "$current_cache_read" "$llm_start_time" "$llm_end_time"
-                    conversation_history=$(echo "$conversation_history" | jq --arg c "$current_output" '. += [{role: "assistant", content: $c}]')
+                    conversation_history=$(echo "$conversation_history" | jq --arg c "$current_output" '. += [{role: "assistant", content: [{type: "text", text: $c}], text: $c}]')
                     current_output=""
                 fi
                 text=$(_turn_extract_text_content "$content")
                 if [ -n "$text" ]; then
-                    conversation_history=$(echo "$conversation_history" | jq --arg c "$text" '. += [{role: "user", content: $c}]')
+                    conversation_history=$(echo "$conversation_history" | jq --arg ts "$timestamp" --arg c "$text" '. += [{role: "user", timestamp: $ts, content: [{type: "text", text: $c}], text: $c}]')
                     [ -z "$TURN_TASK_INPUT" ] && TURN_TASK_INPUT="$text"
                 fi
                 llm_start_time=$(iso_to_nanos "$timestamp")
@@ -272,7 +413,7 @@ parse_turn_transcript() {
 finalize_turn_trace() {
     parse_turn_transcript
 
-    local final_end final_output task_input_json task_attrs task_span root_attrs root_span
+    local final_end final_output task_input_json task_output_json task_attrs task_span root_attrs root_span
     final_end=$(get_time_nanos)
     final_output="${TURN_LAST_OUTPUT:-${TURN_FALLBACK_OUTPUT:-}}"
 
@@ -281,12 +422,14 @@ finalize_turn_trace() {
     fi
 
     final_output="${TURN_LAST_OUTPUT:-${final_output:-Completed}}"
-    task_input_json=$(echo "${TURN_TASK_INPUT:-${TURN_PROMPT:-}}" | _turn_json_string)
+    _turn_build_context_payloads "$final_output"
+    task_input_json=$(echo "$TURN_CONTEXT_INPUT_JSON" | jq -c '.' | _turn_json_string)
+    task_output_json=$(echo "$TURN_CONTEXT_OUTPUT_JSON" | jq -c '.' | _turn_json_string)
 
     task_attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "task" \
         --argjson input "$task_input_json" \
-        --arg output "$final_output" \
+        --argjson output "$task_output_json" \
         --argjson llm "$TURN_LLM_CALLS" \
         --argjson tools "$TURN_TOOL_CALLS" \
         --arg session_id "$TURN_SESSION_ID" \
@@ -308,7 +451,7 @@ finalize_turn_trace() {
     root_attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "task" \
         --argjson input "$task_input_json" \
-        --arg output "$final_output" \
+        --argjson output "$task_output_json" \
         --arg session_id "$TURN_SESSION_ID" \
         --arg workspace "${TURN_WORKSPACE:-}" \
         --arg hostname "$(get_hostname)" \

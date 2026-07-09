@@ -6,6 +6,7 @@ Automatically trace Claude Code sessions to Judgeval for observability and debug
 
 - **Session Grouping**: Group Claude turns into the same Judgment session with `judgment.session_id`
 - **Turn Tracing**: Create one Judgment trace for each user prompt/assistant response turn
+- **Conversation Context**: Store prior user, assistant, system, and tool-result messages in each turn trace input/output
 - **LLM Spans**: Log every model call with input/output and token usage
 - **Tool Spans**: Track tool invocations (file operations, terminal, MCP tools)
 - **Cache Metrics**: Track cache creation and read tokens for prompt caching
@@ -65,8 +66,8 @@ This will prompt you for:
 
 ### Turn Root Span
 - `judgment.span_kind`: "task"
-- `judgment.input`: User prompt
-- `judgment.output`: Assistant response
+- `judgment.input`: JSON envelope with session metadata, prior conversation history, current user prompt, and tool context used by the turn
+- `judgment.output`: JSON envelope with session metadata, assistant output, and the conversation after the turn
 - `judgment.session_id`: Claude Code session ID
 - `turn_index`: Turn number within the Claude session
 
