@@ -320,7 +320,7 @@ ensure_trace() {
         '{
             "judgment.span_kind": $span_kind,
             "judgment.input": $input,
-            "session_id": $session_id,
+            "judgment.session_id": $session_id,
             "workspace": $workspace,
             "hostname": $hostname,
             "username": $username,

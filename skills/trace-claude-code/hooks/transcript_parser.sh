@@ -6,12 +6,20 @@
 # Used incrementally by stop_hook.sh (per turn, from a saved line offset)
 # and by session_end.sh (final sweep for anything the last turn missed).
 #
+# LLM span inputs/outputs preserve the provider message format: assistant
+# content is the raw content-block array (text + tool_use), and tool results
+# are kept in the conversation history as tool_result user messages, so the
+# recorded context window matches what actually went to the model as closely
+# as the transcript allows. (The true system prompt and tool definitions are
+# not present in the transcript and cannot be captured from hooks.)
+#
 # Inputs (globals, set by caller):
 #   PARSE_FILE            transcript path
 #   PARSE_OFFSET          number of lines already processed (default 0)
 #   PARSE_TRACE_ID        trace id spans belong to
 #   PARSE_PROJECT_ID      project id spans are posted to
 #   PARSE_PARENT_SPAN_ID  parent span id for created llm/tool spans
+#   PARSE_SESSION_ID      session id stamped on created spans
 #   PARSE_HISTORY_FILE    optional path persisting conversation history
 #                         across turns (so llm span inputs include prior turns)
 #
@@ -21,34 +29,34 @@
 #   PARSE_FIRST_TS_NANOS PARSE_LAST_TS_NANOS
 ###
 
-_parser_create_llm_span() {
-    local output="$1" model="$2" prompt="$3" completion="$4" history="$5"
-    local cache_create="${6:-0}" cache_read="${7:-0}" start_time="$8" end_time="$9"
-    # An LLM call whose response is only tool_use blocks has no text output
-    # but still consumed tokens and must appear in the trace.
-    if [ -z "$output" ]; then
-        [ -z "$model" ] && return 0
-        local tool_names
-        tool_names=$(echo "$PENDING_TOOLS" | jq -r '[.[].name] | join(", ")' 2>/dev/null)
-        output="[tool call: ${tool_names:-unknown}]"
+# Flushes the accumulated assistant response (raw content blocks + usage)
+# as an llm span, and appends it to the conversation history.
+# Reads/writes parser globals; resets the per-call accumulators.
+_parser_flush_llm_span() {
+    local content_len
+    content_len=$(echo "$CURRENT_CONTENT" | jq 'length' 2>/dev/null || echo 0)
+    if [ "$content_len" -eq 0 ] 2>/dev/null && [ -z "$CURRENT_MODEL" ]; then
+        return 0
     fi
+    [ "$content_len" -eq 0 ] 2>/dev/null && CURRENT_CONTENT='[{"type":"text","text":""}]'
+
     local span_id span_start span_end input_json output_json attrs span duration_ms provider
     span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
-    span_start="${start_time:-$(get_time_nanos)}"
-    span_end="${end_time:-$(get_time_nanos)}"
-    provider=$(detect_provider "$model")
-    input_json=$(echo "$history" | jq -c '.' | jq -Rs '.')
-    output_json=$(jq -n --arg c "$output" '[{role: "assistant", content: $c}]' | jq -c '.' | jq -Rs '.')
+    span_start="${LLM_START_TIME:-$(get_time_nanos)}"
+    span_end="${LLM_END_TIME:-$(get_time_nanos)}"
+    provider=$(detect_provider "$CURRENT_MODEL")
+    input_json=$(echo "$CONVERSATION_HISTORY" | jq -c '.' | jq -Rs '.')
+    output_json=$(jq -cn --argjson c "$CURRENT_CONTENT" '[{role: "assistant", content: $c}]' | jq -Rs '.')
     local usage_meta
-    usage_meta=$(jq -n --argjson inp "$prompt" --argjson out "$completion" \
-        --argjson cc "$cache_create" --argjson cr "$cache_read" \
+    usage_meta=$(jq -n --argjson inp "$CURRENT_PROMPT_TOKENS" --argjson out "$CURRENT_COMPLETION_TOKENS" \
+        --argjson cc "$CURRENT_CACHE_CREATION" --argjson cr "$CURRENT_CACHE_READ" \
         '{input_tokens: $inp, output_tokens: $out, cache_creation_input_tokens: $cc, cache_read_input_tokens: $cr}' | jq -c '.')
     attrs=$(build_otlp_attributes "$(jq -n \
         --arg span_kind "llm" --argjson input "$input_json" --argjson output "$output_json" \
-        --arg model "${model:-claude}" --arg provider "$provider" \
-        --argjson prompt "$prompt" --argjson completion "$completion" \
-        --argjson cache_create "$cache_create" --argjson cache_read "$cache_read" \
-        --arg usage_meta "$usage_meta" \
+        --arg model "${CURRENT_MODEL:-claude}" --arg provider "$provider" \
+        --argjson prompt "$CURRENT_PROMPT_TOKENS" --argjson completion "$CURRENT_COMPLETION_TOKENS" \
+        --argjson cache_create "$CURRENT_CACHE_CREATION" --argjson cache_read "$CURRENT_CACHE_READ" \
+        --arg usage_meta "$usage_meta" --arg session_id "${PARSE_SESSION_ID:-}" \
         '{
           "judgment.span_kind": $span_kind,
           "judgment.input": $input,
@@ -59,14 +67,21 @@ _parser_create_llm_span() {
           "judgment.usage.output_tokens": $completion,
           "judgment.usage.cache_creation_input_tokens": $cache_create,
           "judgment.usage.cache_read_input_tokens": $cache_read,
-          "judgment.usage.metadata": $usage_meta
+          "judgment.usage.metadata": $usage_meta,
+          "judgment.session_id": $session_id
         }')")
-    span=$(build_otlp_span "$PARSE_TRACE_ID" "$span_id" "$PARSE_PARENT_SPAN_ID" "${model:-anthropic.messages.create}" "llm" "$span_start" "$span_end" "$attrs" 20)
+    span=$(build_otlp_span "$PARSE_TRACE_ID" "$span_id" "$PARSE_PARENT_SPAN_ID" "${CURRENT_MODEL:-anthropic.messages.create}" "llm" "$span_start" "$span_end" "$attrs" 20)
     duration_ms=$(( (span_end - span_start) / 1000000 ))
     if insert_span "$PARSE_PROJECT_ID" "$span" >/dev/null; then
         PARSE_LLM_CALLS=$((PARSE_LLM_CALLS + 1))
-        debug "LLM span: $model (${duration_ms}ms) tokens: in=$prompt out=$completion cache_create=$cache_create cache_read=$cache_read"
+        debug "LLM span: $CURRENT_MODEL (${duration_ms}ms) tokens: in=$CURRENT_PROMPT_TOKENS out=$CURRENT_COMPLETION_TOKENS cache_create=$CURRENT_CACHE_CREATION cache_read=$CURRENT_CACHE_READ"
     fi
+
+    CONVERSATION_HISTORY=$(jq -cn --argjson h "$CONVERSATION_HISTORY" --argjson c "$CURRENT_CONTENT" \
+        '$h + [{role: "assistant", content: $c}]')
+    [ -n "$CURRENT_OUTPUT" ] && PARSE_LAST_OUTPUT="$CURRENT_OUTPUT"
+    CURRENT_CONTENT="[]"
+    CURRENT_OUTPUT=""
     return 0
 }
 
@@ -77,8 +92,8 @@ _parser_create_tool_span() {
     span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
     input_json=$(echo "$tool_input" | jq -c '.' 2>/dev/null | jq -Rs '.')
     output_json=$(echo "$tool_output" | jq -Rs '.')
-    attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" \
-        '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name}')")
+    attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" --arg session_id "${PARSE_SESSION_ID:-}" \
+        '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "judgment.session_id": $session_id}')")
     span=$(build_otlp_span "$PARSE_TRACE_ID" "$span_id" "$PARSE_PARENT_SPAN_ID" "$tool_name" "tool" "$start_time" "$end_time" "$attrs" 20)
     if insert_span "$PARSE_PROJECT_ID" "$span" >/dev/null; then
         PARSE_TOOL_CALLS=$((PARSE_TOOL_CALLS + 1))
@@ -101,12 +116,17 @@ parse_transcript_chunk() {
         return 0
     fi
 
-    local CURRENT_OUTPUT="" CURRENT_MODEL=""
-    local CURRENT_PROMPT_TOKENS=0 CURRENT_COMPLETION_TOKENS=0
-    local CURRENT_CACHE_CREATION=0 CURRENT_CACHE_READ=0
-    local LLM_START_TIME="" LLM_END_TIME=""
+    CURRENT_CONTENT="[]"
+    CURRENT_OUTPUT=""
+    CURRENT_MODEL=""
+    CURRENT_PROMPT_TOKENS=0
+    CURRENT_COMPLETION_TOKENS=0
+    CURRENT_CACHE_CREATION=0
+    CURRENT_CACHE_READ=0
+    LLM_START_TIME=""
+    LLM_END_TIME=""
     local PENDING_TOOLS="{}"
-    local CONVERSATION_HISTORY="[]"
+    CONVERSATION_HISTORY="[]"
 
     if [ -n "$PARSE_HISTORY_FILE" ] && [ -f "$PARSE_HISTORY_FILE" ]; then
         CONVERSATION_HISTORY=$(cat "$PARSE_HISTORY_FILE" 2>/dev/null)
@@ -139,14 +159,11 @@ parse_transcript_chunk() {
             fi
 
             if [ "$CONTENT_TYPE" = "tool_result" ]; then
-                if [ -n "$CURRENT_OUTPUT" ] || [ -n "$CURRENT_MODEL" ]; then
-                    _parser_create_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CONVERSATION_HISTORY" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
-                    if [ -n "$CURRENT_OUTPUT" ]; then
-                        CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg c "$CURRENT_OUTPUT" '. += [{role: "assistant", content: $c}]')
-                        PARSE_LAST_OUTPUT="$CURRENT_OUTPUT"
-                    fi
-                    CURRENT_OUTPUT=""
-                fi
+                _parser_flush_llm_span
+                # Keep the tool results in the recorded context window,
+                # exactly as they went back to the model.
+                CONVERSATION_HISTORY=$(jq -cn --argjson h "$CONVERSATION_HISTORY" --argjson c "$CONTENT" \
+                    '$h + [{role: "user", content: $c}]' 2>/dev/null || echo "$CONVERSATION_HISTORY")
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
 
                 local TOOL_USE_RESULT TOOL_RESULT TOOL_USE_ID TOOL_TYPE FILE_CONTENT TOOL_OUT RAW_OUT PENDING P_NAME P_INPUT P_START END_NANOS
@@ -193,11 +210,7 @@ parse_transcript_chunk() {
                 done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null)
                 CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0
             else
-                if [ -n "$CURRENT_OUTPUT" ]; then
-                    _parser_create_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CONVERSATION_HISTORY" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
-                    CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg c "$CURRENT_OUTPUT" '. += [{role: "assistant", content: $c}]')
-                    PARSE_LAST_OUTPUT="$CURRENT_OUTPUT"
-                fi
+                _parser_flush_llm_span
                 if [ "$CONTENT" != "null" ] && [ -n "$CONTENT" ]; then
                     local TXT="$CONTENT"
                     if echo "$CONTENT" | jq -e '.' >/dev/null 2>&1; then
@@ -207,10 +220,19 @@ parse_transcript_chunk() {
                     [ -z "$PARSE_FIRST_USER_INPUT" ] && [ -n "$TXT" ] && PARSE_FIRST_USER_INPUT="$TXT"
                 fi
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
-                CURRENT_OUTPUT=""; CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0
+                CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0
             fi
         elif [ "$MSG_TYPE" = "assistant" ]; then
             LLM_END_TIME=$(iso_to_nanos "$TIMESTAMP")
+
+            # Accumulate the raw provider content blocks (text + tool_use),
+            # normalizing plain-string content into a text block.
+            local RAW_CONTENT
+            RAW_CONTENT=$(echo "$line" | jq -c '.message.content // empty' 2>/dev/null)
+            if [ -n "$RAW_CONTENT" ] && [ "$RAW_CONTENT" != "null" ]; then
+                RAW_CONTENT=$(echo "$RAW_CONTENT" | jq -c 'if type == "string" then [{type: "text", text: .}] else . end' 2>/dev/null)
+                CURRENT_CONTENT=$(jq -cn --argjson a "$CURRENT_CONTENT" --argjson b "$RAW_CONTENT" '$a + $b' 2>/dev/null || echo "$CURRENT_CONTENT")
+            fi
 
             if echo "$line" | jq -e '.message.content | type == "array"' >/dev/null 2>&1; then
                 local TOOL_USE TOOL_ID TOOL_NAME TOOL_INPUT
@@ -246,11 +268,7 @@ parse_transcript_chunk() {
         fi
     done < <(tail -n +$(( ${PARSE_OFFSET:-0} + 1 )) "$PARSE_FILE")
 
-    if [ -n "$CURRENT_OUTPUT" ]; then
-        _parser_create_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CONVERSATION_HISTORY" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME"
-        CONVERSATION_HISTORY=$(echo "$CONVERSATION_HISTORY" | jq --arg c "$CURRENT_OUTPUT" '. += [{role: "assistant", content: $c}]')
-        PARSE_LAST_OUTPUT="$CURRENT_OUTPUT"
-    fi
+    _parser_flush_llm_span
 
     if [ -n "$PARSE_HISTORY_FILE" ]; then
         echo "$CONVERSATION_HISTORY" > "$PARSE_HISTORY_FILE" 2>/dev/null || true

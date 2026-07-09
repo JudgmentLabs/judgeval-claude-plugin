@@ -117,7 +117,8 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
               "judgment.llm.model": $model,
               "judgment.usage.non_cached_input_tokens": $prompt,
               "judgment.usage.output_tokens": $completion,
-              "subagent_id": "'"$SUBAGENT_ID"'"
+              "subagent_id": "'"$SUBAGENT_ID"'",
+              "judgment.session_id": "'"$PARENT_SESSION_ID"'"
             }')")
         
         span=$(build_otlp_span "$TRACE_ID" "$span_id" "$SUBAGENT_SPAN_ID" "${model:-anthropic.messages.create}" "llm" "$start_time" "$end_time" "$attrs" 20)
@@ -138,7 +139,7 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
         output_json=$(echo "$tool_output" | jq -Rs '.')
         
         attrs=$(build_otlp_attributes "$(jq -n --arg span_kind "tool" --argjson input "$input_json" --argjson output "$output_json" --arg tool_name "$tool_name" --arg subagent_id "$SUBAGENT_ID" \
-            '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "subagent_id": $subagent_id}')")
+            '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "tool_name": $tool_name, "subagent_id": $subagent_id, "judgment.session_id": "'"$PARENT_SESSION_ID"'"}')")
         
         span=$(build_otlp_span "$TRACE_ID" "$span_id" "$SUBAGENT_SPAN_ID" "$tool_name" "tool" "$start_time" "$end_time" "$attrs" 20)
         
@@ -269,8 +270,10 @@ SUBAGENT_ATTRS=$(build_otlp_attributes "$(jq -n \
     --arg subagent_id "${SUBAGENT_ID:-unknown}" \
     --argjson llm_calls "$LLM_CALLS" \
     --argjson tool_calls "$TOOL_CALLS" \
+    --arg session_id "$PARENT_SESSION_ID" \
     '{
         "judgment.span_kind": $span_kind,
+        "judgment.session_id": $session_id,
         "judgment.input": $input,
         "judgment.output": $output,
         "subagent_id": $subagent_id,

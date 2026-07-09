@@ -43,7 +43,7 @@ ATTRIBUTES=$(build_otlp_attributes "$(jq -n \
     --arg span_kind "task" \
     --argjson input "$PROMPT_JSON" \
     --arg session_id "$SESSION_ID" \
-    '{ "judgment.span_kind": $span_kind, "judgment.input": $input, "session_id": $session_id }')")
+    '{ "judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.session_id": $session_id }')")
 
 SPAN=$(build_otlp_span "$TRACE_ID" "$TASK_SPAN_ID" "$ROOT_SPAN_ID" "Task" "task" "$START_TIME" "$START_TIME" "$ATTRIBUTES" 0)
 insert_span "$PROJECT_ID" "$SPAN" || { log "ERROR" "Failed to create task span"; exit 0; }

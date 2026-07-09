@@ -53,6 +53,7 @@ PARSE_FILE="$TRANSCRIPT_PATH"
 PARSE_OFFSET="${OFFSET:-0}"
 PARSE_TRACE_ID="$TRACE_ID"
 PARSE_PROJECT_ID="$PROJECT_ID"
+PARSE_SESSION_ID="$SESSION_ID"
 PARSE_PARENT_SPAN_ID="$TASK_SPAN_ID"
 PARSE_HISTORY_FILE=$(session_history_file "$SESSION_ID")
 parse_transcript_chunk
@@ -75,7 +76,7 @@ TASK_ATTRS=$(build_otlp_attributes "$(jq -n \
     --argjson llm "$PARSE_LLM_CALLS" \
     --argjson tools "$PARSE_TOOL_CALLS" \
     --arg session_id "$SESSION_ID" \
-    '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "llm_call_count": $llm, "tool_count": $tools, "session_id": $session_id}')")
+    '{"judgment.span_kind": $span_kind, "judgment.input": $input, "judgment.output": $output, "llm_call_count": $llm, "tool_count": $tools, "judgment.session_id": $session_id}')")
 TASK_SPAN=$(build_otlp_span "$TRACE_ID" "$TASK_SPAN_ID" "$ROOT_SPAN_ID" "Task" "task" "$TASK_START" "$TASK_END" "$TASK_ATTRS" 20)
 insert_span "$PROJECT_ID" "$TASK_SPAN" >/dev/null || debug "Failed to finalize task"
 
