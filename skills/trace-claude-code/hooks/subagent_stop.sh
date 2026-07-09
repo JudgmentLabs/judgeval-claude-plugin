@@ -228,6 +228,19 @@ LLM_END_TIME=""
 PENDING_TOOLS="{}"
 CURRENT_TOOL_USES="[]"
 CONVERSATION_HISTORY="[]"
+CURRENT_REQUEST_ID=""
+EMITTED_REQUEST_IDS="{}"
+
+# requestId -> final usage + last-chunk timestamp. A request's chunks can
+# interleave with tool results, so a flush can fire before the final chunk;
+# spans must still carry the request's final usage exactly once.
+REQUEST_FINAL=$(jq -cs '
+    [ .[] | select((.type // "") == "assistant" and (.requestId // "") != "")
+      | {rid: .requestId, usage: (.message.usage // .usage // {}), ts: (.timestamp // "")} ]
+    | group_by(.rid)
+    | map({key: .[0].rid, value: (last | {usage: .usage, ts: .ts})})
+    | from_entries' "$SUBAGENT_TRANSCRIPT" 2>/dev/null)
+[ -z "$REQUEST_FINAL" ] && REQUEST_FINAL="{}"
 
 subagent_llm_output_text() {
     local text="$1" tool_uses="$2"
@@ -299,8 +312,33 @@ subagent_tool_output_from_result() {
         local output="$1" model="$2" prompt="$3" completion="$4"
         local cache_create="${5:-0}" cache_read="${6:-0}" start_time="$7" end_time="$8"
         local history="${9:-[]}"
+        local request_id="${10:-}"
         [ -z "$output" ] && return
-        
+
+        if [ -n "$request_id" ] && echo "$EMITTED_REQUEST_IDS" | jq -e --arg id "$request_id" '.[$id] == true' >/dev/null 2>&1; then
+            debug "Skipping duplicate subagent LLM span for requestId=$request_id"
+            return
+        fi
+        if [ -n "$request_id" ]; then
+            local final_entry fv
+            final_entry=$(echo "$REQUEST_FINAL" | jq -c --arg id "$request_id" '.[$id] // empty')
+            if [ -n "$final_entry" ]; then
+                fv=$(echo "$final_entry" | jq -r '.usage.input_tokens // 0')
+                [ "$fv" -gt 0 ] 2>/dev/null && prompt=$fv
+                fv=$(echo "$final_entry" | jq -r '.usage.output_tokens // 0')
+                [ "$fv" -gt 0 ] 2>/dev/null && completion=$fv
+                fv=$(echo "$final_entry" | jq -r '.usage.cache_creation_input_tokens // 0')
+                [ "$fv" -gt 0 ] 2>/dev/null && cache_create=$fv
+                fv=$(echo "$final_entry" | jq -r '.usage.cache_read_input_tokens // 0')
+                [ "$fv" -gt 0 ] 2>/dev/null && cache_read=$fv
+                fv=$(echo "$final_entry" | jq -r '.ts // empty')
+                if [ -n "$fv" ]; then
+                    fv=$(iso_to_nanos "$fv")
+                    [ "$fv" -gt "${end_time:-0}" ] 2>/dev/null && end_time="$fv"
+                fi
+            fi
+        fi
+
         local span_id provider input_json output_json attrs span usage_meta history_json output_messages_json
         span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
         provider=$(detect_provider "$model")
@@ -351,6 +389,9 @@ subagent_tool_output_from_result() {
         
         if insert_span "$PROJECT_ID" "$span" >/dev/null; then
             LLM_CALLS=$((LLM_CALLS + 1))
+            if [ -n "$request_id" ]; then
+                EMITTED_REQUEST_IDS=$(echo "$EMITTED_REQUEST_IDS" | jq --arg id "$request_id" '.[$id] = true')
+            fi
             debug "Subagent LLM span: $model"
         fi
     }
@@ -404,7 +445,7 @@ subagent_tool_output_from_result() {
                 # Flush pending LLM span
                 LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
                 if [ -n "$LLM_OUTPUT" ]; then
-                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY"
+                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY" "$CURRENT_REQUEST_ID"
                     CONVERSATION_HISTORY=$(subagent_append_assistant_history "$CONVERSATION_HISTORY" "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES" "$TIMESTAMP")
                     CURRENT_OUTPUT=""
                     CURRENT_TOOL_USES="[]"
@@ -437,12 +478,12 @@ subagent_tool_output_from_result() {
                         '. += [{role: "tool", timestamp: $ts, tool_use_id: $id, content: [{type: "tool_result", content: $c}], text: $c}]')
                 done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null)
                 
-                CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0
+                CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0; CURRENT_REQUEST_ID=""
             else
                 # Regular user message - flush pending LLM span
                 LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
                 if [ -n "$LLM_OUTPUT" ]; then
-                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY"
+                    create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY" "$CURRENT_REQUEST_ID"
                     CONVERSATION_HISTORY=$(subagent_append_assistant_history "$CONVERSATION_HISTORY" "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES" "$TIMESTAMP")
                 fi
                 TEXT=$(subagent_extract_text_content "$CONTENT")
@@ -456,7 +497,9 @@ subagent_tool_output_from_result() {
             
         elif [ "$MSG_TYPE" = "assistant" ]; then
             LLM_END_TIME=$(iso_to_nanos "$TIMESTAMP")
-            
+            REQUEST_ID=$(echo "$line" | jq -r '.requestId // .request_id // empty' 2>/dev/null)
+            [ -n "$REQUEST_ID" ] && CURRENT_REQUEST_ID="$REQUEST_ID"
+
             # Track tool_use blocks
             if echo "$line" | jq -e '.message.content | type == "array"' >/dev/null 2>&1; then
                 while IFS= read -r TOOL_USE; do
@@ -503,7 +546,7 @@ subagent_tool_output_from_result() {
     # Flush final LLM span
     LLM_OUTPUT=$(subagent_llm_output_text "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES")
     if [ -n "$LLM_OUTPUT" ]; then
-        create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY"
+        create_subagent_llm_span "$LLM_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$CURRENT_CACHE_CREATION" "$CURRENT_CACHE_READ" "$LLM_START_TIME" "$LLM_END_TIME" "$CONVERSATION_HISTORY" "$CURRENT_REQUEST_ID"
         CONVERSATION_HISTORY=$(subagent_append_assistant_history "$CONVERSATION_HISTORY" "$CURRENT_OUTPUT" "$CURRENT_TOOL_USES" "$LLM_END_TIME")
     fi
 fi

@@ -212,6 +212,31 @@ _turn_create_llm_span() {
         return
     fi
 
+    # A request's chunks can interleave with tool results (Claude streams the
+    # next tool_use while the first tool runs), so a flush can fire before the
+    # request's final chunk. Use the request's final usage and last-chunk end
+    # time, precomputed over the whole turn slice.
+    if [ -n "$request_id" ] && [ -n "${TURN_REQUEST_FINAL:-}" ]; then
+        local final_entry
+        final_entry=$(echo "$TURN_REQUEST_FINAL" | jq -c --arg id "$request_id" '.[$id] // empty')
+        if [ -n "$final_entry" ]; then
+            local fv
+            fv=$(echo "$final_entry" | jq -r '.usage.input_tokens // 0')
+            [ "$fv" -gt 0 ] 2>/dev/null && prompt_tokens=$fv
+            fv=$(echo "$final_entry" | jq -r '.usage.output_tokens // 0')
+            [ "$fv" -gt 0 ] 2>/dev/null && completion_tokens=$fv
+            fv=$(echo "$final_entry" | jq -r '.usage.cache_creation_input_tokens // 0')
+            [ "$fv" -gt 0 ] 2>/dev/null && cache_create=$fv
+            fv=$(echo "$final_entry" | jq -r '.usage.cache_read_input_tokens // 0')
+            [ "$fv" -gt 0 ] 2>/dev/null && cache_read=$fv
+            fv=$(echo "$final_entry" | jq -r '.ts // empty')
+            if [ -n "$fv" ]; then
+                fv=$(iso_to_nanos "$fv")
+                [ "$fv" -gt "$span_end" ] 2>/dev/null && span_end="$fv"
+            fi
+        fi
+    fi
+
     input_payload=$(_turn_context_payload "$history_json" "" "false")
     output_messages_json=$(jq -cn \
         --slurpfile history_f <(printf '%s\n' "$history_json") \
@@ -342,6 +367,15 @@ parse_turn_transcript() {
     local current_cache_creation=0 current_cache_read=0 llm_start_time="" llm_end_time="" current_request_id=""
     local conversation_history pending_tools="{}" current_tool_uses="[]" llm_output turn_start_aligned=""
     conversation_history=$(_turn_normalized_messages_through "$conv_file" "${TURN_OFFSET:-0}" "all")
+
+    # requestId -> final usage + last-chunk timestamp for this turn's records
+    TURN_REQUEST_FINAL=$(tail -n +$(( ${TURN_OFFSET:-0} + 1 )) "$conv_file" | jq -cs '
+        [ .[] | select((.type // "") == "assistant" and (.requestId // "") != "")
+          | {rid: .requestId, usage: (.message.usage // .usage // {}), ts: (.timestamp // "")} ]
+        | group_by(.rid)
+        | map({key: .[0].rid, value: (last | {usage: .usage, ts: .ts})})
+        | from_entries' 2>/dev/null)
+    [ -z "$TURN_REQUEST_FINAL" ] && TURN_REQUEST_FINAL="{}"
 
     while IFS= read -r line; do
         [ -z "$line" ] && continue
