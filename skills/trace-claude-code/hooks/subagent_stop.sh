@@ -26,15 +26,17 @@ echo "$INPUT" | jq -e '.' >/dev/null 2>&1 || { debug "Invalid JSON"; exit 0; }
 SUBAGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // .subagent_id // empty' 2>/dev/null)
 SUBAGENT_TRANSCRIPT=$(echo "$INPUT" | jq -r '.agent_transcript_path // empty' 2>/dev/null)
 TASK_DESCRIPTION=$(echo "$INPUT" | jq -r '.task // .description // empty' 2>/dev/null)
+LAST_ASSISTANT=$(echo "$INPUT" | jq -r '.last_assistant_message // empty' 2>/dev/null)
 PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // empty' 2>/dev/null)
+[ -z "$PARENT_SESSION_ID" ] && { debug "No session ID"; exit 0; }
 
-# Get parent trace context
-TRACE_ID=$(get_state_value "current_trace_id")
+# Get parent trace context (keyed by the parent session)
+TRACE_ID=$(get_session_state "$PARENT_SESSION_ID" "trace_id")
 [ -z "$TRACE_ID" ] && { debug "No current trace"; exit 0; }
 
-PARENT_TASK_SPAN_ID=$(get_session_state "$TRACE_ID" "current_task_span_id")
-PROJECT_ID=$(get_session_state "$TRACE_ID" "project_id")
-ROOT_SPAN_ID=$(get_session_state "$TRACE_ID" "root_span_id")
+PARENT_TASK_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "current_task_span_id")
+PROJECT_ID=$(get_session_state "$PARENT_SESSION_ID" "project_id")
+ROOT_SPAN_ID=$(get_session_state "$PARENT_SESSION_ID" "root_span_id")
 
 [ -z "$PROJECT_ID" ] && { debug "No project ID"; exit 0; }
 [ -z "$ROOT_SPAN_ID" ] && { debug "No root span"; exit 0; }
@@ -46,10 +48,20 @@ PARENT_SPAN_ID="${PARENT_TASK_SPAN_ID:-$ROOT_SPAN_ID}"
 SUBAGENT_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
 START_TIME=$(get_time_nanos)
 
-# If no transcript path provided, try to find it
+# The provided agent_transcript_path may not be written yet when this hook
+# fires (observed live: the path referenced a subagents/ dir that did not
+# exist). Wait briefly for it before falling back to a search.
+if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ ! -f "$SUBAGENT_TRANSCRIPT" ]; then
+    for _ in 1 2 3 4; do
+        sleep 0.5
+        [ -f "$SUBAGENT_TRANSCRIPT" ] && break
+    done
+    [ -f "$SUBAGENT_TRANSCRIPT" ] || debug "Provided agent transcript never appeared: $SUBAGENT_TRANSCRIPT"
+fi
 if [ -z "$SUBAGENT_TRANSCRIPT" ] || [ ! -f "$SUBAGENT_TRANSCRIPT" ]; then
     if [ -n "$SUBAGENT_ID" ]; then
         for pattern in \
+            "$HOME/.claude/projects/*/*/subagents/agent-${SUBAGENT_ID}.jsonl" \
             "$HOME/.claude/projects/*/agent-${SUBAGENT_ID}.jsonl" \
             "$HOME/.claude/projects/*/${SUBAGENT_ID}.jsonl" \
             "$HOME/.claude/state/agent-${SUBAGENT_ID}.jsonl"; do
@@ -79,6 +91,7 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
     LLM_START_TIME=""
     LLM_END_TIME=""
     PENDING_TOOLS="{}"
+    FIRST_TS_NANOS=""
 
     create_subagent_llm_span() {
         local output="$1" model="$2" prompt="$3" completion="$4"
@@ -141,6 +154,9 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
         
         MSG_TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
         TIMESTAMP=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
+        if [ -z "$FIRST_TS_NANOS" ] && [ -n "$TIMESTAMP" ]; then
+            FIRST_TS_NANOS=$(iso_to_nanos "$TIMESTAMP")
+        fi
         
         if [ "$MSG_TYPE" = "user" ]; then
             CONTENT=$(echo "$line" | jq -c '.message.content // empty' 2>/dev/null)
@@ -237,8 +253,12 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
     [ -n "$CURRENT_OUTPUT" ] && create_subagent_llm_span "$CURRENT_OUTPUT" "$CURRENT_MODEL" "$CURRENT_PROMPT_TOKENS" "$CURRENT_COMPLETION_TOKENS" "$LLM_START_TIME" "$LLM_END_TIME"
 fi
 
-# Create the subagent container span
+# Create the subagent container span. Prefer real data over placeholders:
+# last_assistant_message from the hook input when the transcript was
+# unavailable, and the transcript's own first timestamp for the start.
 END_TIME=$(get_time_nanos)
+[ -z "$SUBAGENT_OUTPUT" ] && SUBAGENT_OUTPUT="$LAST_ASSISTANT"
+[ -n "$FIRST_TS_NANOS" ] && [ "$FIRST_TS_NANOS" -gt 0 ] 2>/dev/null && START_TIME="$FIRST_TS_NANOS"
 TASK_INPUT_JSON=$(echo "${TASK_DESCRIPTION:-Subagent task}" | jq -Rs '.')
 SUBAGENT_OUTPUT_JSON=$(echo "${SUBAGENT_OUTPUT:-Completed}" | jq -Rs '.')
 

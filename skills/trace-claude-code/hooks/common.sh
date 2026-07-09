@@ -203,10 +203,18 @@ insert_span_sync() {
 }
 
 # Project Resolution
+_set_project_id_unsafe() {
+    local state
+    state=$(load_state)
+    save_state "$(echo "$state" | jq --arg n "$1" --arg v "$2" '.project_ids[$n] = $v')"
+}
+
 get_project_id() {
     local name="$1"
     local cached_id
-    cached_id=$(get_state_value "project_id")
+    # Cache is keyed by project name: different workspaces may trace to
+    # different projects, so a single global cached id routes spans wrong.
+    cached_id=$(load_state | jq -r --arg n "$name" '.project_ids[$n] // empty')
     if [ -n "$cached_id" ]; then
         echo "$cached_id"
         return 0
@@ -224,7 +232,7 @@ get_project_id() {
 
     pid=$(echo "$resp" | jq -r '.project_id // empty' 2>/dev/null)
     if [ -n "$pid" ]; then
-        set_state_value "project_id" "$pid"
+        with_lock _set_project_id_unsafe "$name" "$pid"
         echo "$pid"
         return 0
     fi
@@ -239,13 +247,102 @@ get_project_id() {
 
     pid=$(echo "$resp" | jq -r '.project_id // empty' 2>/dev/null)
     if [ -n "$pid" ]; then
-        set_state_value "project_id" "$pid"
+        with_lock _set_project_id_unsafe "$name" "$pid"
         echo "$pid"
         return 0
     fi
 
     log "ERROR" "Failed to get or create project: $name"
     return 1
+}
+
+
+# Per-Session Trace Lifecycle
+#
+# All trace state is keyed by the Claude Code session id. A single global
+# current_trace_id breaks as soon as two sessions run concurrently: the
+# second SessionStart overwrites the first session's trace, and whichever
+# session ends first clears the pointer and silently un-traces the other.
+
+clear_session_state() {
+    with_lock _clear_session_state_unsafe "$1"
+}
+
+_clear_session_state_unsafe() {
+    local state
+    state=$(load_state)
+    save_state "$(echo "$state" | jq --arg s "$1" 'del(.sessions[$s])')"
+}
+
+session_history_file() {
+    echo "$HOME/.claude/state/judgeval_history_$1.json"
+}
+
+# ensure_trace SESSION_ID WORKSPACE [TRANSCRIPT_PATH]
+# Idempotent: creates the trace + root span for a session if it doesn't
+# exist yet, so any hook (not just SessionStart) can recover a session that
+# was started before the plugin was installed or whose SessionStart failed.
+# Sets TRACE_ID on success.
+#
+# The transcript may already contain lines when the trace is created (a
+# resumed session, or a mid-session plugin install): those lines belong to
+# earlier traces or to the untraced past, so parsing starts after them.
+ensure_trace() {
+    local session_id="$1" workspace="$2" transcript_path="$3"
+    TRACE_ID=$(get_session_state "$session_id" "trace_id")
+    [ -n "$TRACE_ID" ] && return 0
+
+    local initial_offset=0
+    if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+        initial_offset=$(awk 'END{print NR}' "$transcript_path" 2>/dev/null || echo 0)
+        [ "$initial_offset" -gt 0 ] 2>/dev/null || initial_offset=0
+        [ "$initial_offset" -gt 0 ] && debug "Trace starts at transcript line $initial_offset"
+    fi
+
+    local project_id trace_id span_id workspace_name start_time attrs span
+    project_id=$(get_project_id "$PROJECT") || { log "ERROR" "Failed to get project"; return 1; }
+
+    trace_id=$(generate_uuid | sed 's/-//g' | head -c 32)
+    while [ ${#trace_id} -lt 32 ]; do trace_id="${trace_id}0"; done
+    span_id=$(generate_uuid | sed 's/-//g' | head -c 16)
+    workspace_name=$(basename "${workspace:-.}" 2>/dev/null || echo "Claude Code")
+    [ -z "$workspace_name" ] || [ "$workspace_name" = "." ] && workspace_name="Claude Code"
+    start_time=$(get_time_nanos)
+
+    attrs=$(build_otlp_attributes "$(jq -n \
+        --arg span_kind "task" \
+        --arg input "Session: $workspace_name" \
+        --arg session_id "$session_id" \
+        --arg workspace "${workspace:-}" \
+        --arg hostname "$(get_hostname)" \
+        --arg username "$(get_username)" \
+        --arg os "$(get_os)" \
+        '{
+            "judgment.span_kind": $span_kind,
+            "judgment.input": $input,
+            "session_id": $session_id,
+            "workspace": $workspace,
+            "hostname": $hostname,
+            "username": $username,
+            "os": $os,
+            "source": "claude-code"
+        }')")
+
+    span=$(build_otlp_span "$trace_id" "$span_id" "" "Claude Code: $workspace_name" "task" "$start_time" "$start_time" "$attrs" 0)
+    insert_span_sync "$project_id" "$span" >/dev/null || { log "ERROR" "Failed to create session root"; return 1; }
+
+    set_session_state_batch "$session_id" \
+        "trace_id" "$trace_id" \
+        "root_span_id" "$span_id" \
+        "project_id" "$project_id" \
+        "workspace_name" "$workspace_name" \
+        "workspace" "${workspace:-}" \
+        "started" "$start_time" \
+        "transcript_offset" "$initial_offset"
+
+    TRACE_ID="$trace_id"
+    log "INFO" "Created trace: $trace_id (session=$session_id)"
+    return 0
 }
 
 # Time Utilities
