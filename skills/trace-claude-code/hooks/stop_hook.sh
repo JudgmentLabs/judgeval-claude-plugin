@@ -4,6 +4,7 @@
 ###
 
 set -e
+trap 'exit 0' ERR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
@@ -44,7 +45,7 @@ attach_task_notification_followup() {
         <<< "$(get_session_fields "$SESSION_ID" parent_session_id parent_trace_id task_notification_project_id task_notification_root_span_id task_notification_task_span_id task_notification_trace_start task_notification_task_start task_notification_turn_index task_notification_task_id task_notification_task_input_json task_notification_task_output_json task_notification_llm_calls task_notification_tool_calls task_notification_workspace task_notification_workspace_name task_notification_hostname task_notification_username task_notification_os)"
     notification=$(get_session_state "$SESSION_ID" "task_notification_prompt")
 
-    [ -n "$trace_id" ] && [ -n "$project_id" ] && [ -n "$root_span_id" ] && [ -n "$task_span_id" ] && [ -n "$parent_session" ] || {
+    [ -n "$trace_id" ] && [ -n "$root_span_id" ] && [ -n "$task_span_id" ] && [ -n "$parent_session" ] || {
         debug "Missing parent trace state for task-notification follow-up"
         return 0
     }
@@ -270,7 +271,7 @@ IFS=$'\x1f' read -r TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID TRACE_START TA
     <<< "$(get_session_fields "$SESSION_ID" active_trace_id project_id active_root_span_id active_task_span_id active_trace_start active_task_start active_prompt active_transcript_offset turn_count workspace transcript_path)"
 
 [ -z "$TRACE_ID" ] && { debug "No active turn trace"; exit 0; }
-[ -z "$PROJECT_ID" ] || [ -z "$ROOT_SPAN_ID" ] || [ -z "$TASK_SPAN_ID" ] && { debug "Missing active trace state"; exit 0; }
+[ -z "$ROOT_SPAN_ID" ] || [ -z "$TASK_SPAN_ID" ] && { debug "Missing active trace state"; exit 0; }
 
 TRANSCRIPT_PATH=$(find_transcript_path "$SESSION_ID" "${TRANSCRIPT_PATH:-$STATE_TRANSCRIPT}" || true)
 WORKSPACE_NAME=$(basename "$WORKSPACE" 2>/dev/null || echo "Claude Code")

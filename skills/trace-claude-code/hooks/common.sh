@@ -5,11 +5,14 @@
 export LOG_FILE="$HOME/.claude/state/judgeval_hook.log"
 export STATE_FILE="$HOME/.claude/state/judgeval_state.json"
 export LOCK_DIR="$HOME/.claude/state/judgeval.lock.d"
+export QUEUE_DIR="$HOME/.claude/state/judgeval_queue"
 export DEBUG="${JUDGEVAL_CC_DEBUG:-false}"
 export API_KEY="${JUDGMENT_API_KEY}"
 export ORG_ID="${JUDGMENT_ORG_ID}"
 export PROJECT="${JUDGEVAL_CC_PROJECT:-claude-code}"
 export API_URL="${JUDGMENT_API_URL:-https://api.judgmentlabs.ai}"
+JUDGEVAL_HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export JUDGEVAL_HOOKS_DIR
 
 mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")"
 
@@ -198,17 +201,19 @@ _build_otlp_payload() {
     }'
 }
 
-insert_span() {
+# Direct HTTP upload of one span. Only the background worker calls this;
+# hooks must never touch the network (see insert_span below).
+_http_insert_span() {
     local project_id="$1" span_json="$2"
     local otlp_payload resp http_code
-    
+
     debug "Inserting span: $(echo "$span_json" | jq -c '.name' 2>/dev/null)"
-    
+
     otlp_payload=$(_build_otlp_payload "$span_json")
-    
+
     resp=$(printf '%s' "$otlp_payload" | curl -s -w "\n%{http_code}" \
-        --max-time 5 \
-        --connect-timeout 3 \
+        --max-time 60 \
+        --connect-timeout 5 \
         -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
@@ -216,18 +221,39 @@ insert_span() {
         -H "Content-Type: application/json" \
         --data-binary @- \
         "$API_URL/otel/v1/traces" 2>&1)
-    
+
     http_code=$(echo "$resp" | tail -1)
-    
+
     if [[ "$http_code" =~ ^20[012]$ ]]; then
         debug "OTLP insert successful (HTTP $http_code)"
-        echo "success"
         return 0
     fi
-    
+
     log "WARN" "OTLP insert failed (HTTP $http_code)"
-    echo "failed"
     return 1
+}
+
+# Queue a span for background upload and return immediately. Hooks call this
+# instead of doing network I/O so they never block Claude Code. project_id may
+# be empty; the worker resolves $PROJECT by name and caches the id.
+insert_span() {
+    local project_id="$1" span_json="$2"
+    local qfile tmp
+
+    mkdir -p "$QUEUE_DIR/pending" "$QUEUE_DIR/processing" 2>/dev/null || return 0
+
+    qfile="$QUEUE_DIR/pending/$(get_time_nanos)-$$-$RANDOM.json"
+    tmp="$qfile.tmp"
+    jq -cn \
+        --arg project_id "$project_id" \
+        --arg project_name "$PROJECT" \
+        --slurpfile span_f <(printf '%s\n' "$span_json") \
+        '{project_id: $project_id, project_name: $project_name, attempts: 0, span: $span_f[0]}' \
+        > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    mv -f "$tmp" "$qfile" 2>/dev/null || { rm -f "$tmp"; return 0; }
+
+    ensure_worker_running
+    return 0
 }
 
 # Alias for backward compatibility
@@ -235,7 +261,27 @@ insert_span_sync() {
     insert_span "$@"
 }
 
+# Spawn the background queue worker if one is not already running. The worker
+# is detached from the hook process so hook exit (or kill) never affects it.
+ensure_worker_running() {
+    local pid_file="$QUEUE_DIR/worker.pid" pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    nohup bash "$JUDGEVAL_HOOKS_DIR/worker.sh" </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    return 0
+}
+
 # Project Resolution
+#
+# Hooks may only use the cached id (no network); the background worker
+# resolves the project name via the API on first upload and caches it.
+get_cached_project_id() {
+    get_state_value "project_id"
+}
+
 get_project_id() {
     local name="$1"
     local cached_id
@@ -248,7 +294,7 @@ get_project_id() {
     debug "Resolving project: $name"
     local resp pid
 
-    resp=$(curl -sf -X POST \
+    resp=$(curl -sf --max-time 10 --connect-timeout 5 -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "Content-Type: application/json" \
@@ -263,7 +309,7 @@ get_project_id() {
     fi
 
     debug "Creating project: $name"
-    resp=$(curl -sf -X POST \
+    resp=$(curl -sf --max-time 10 --connect-timeout 5 -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "Content-Type: application/json" \

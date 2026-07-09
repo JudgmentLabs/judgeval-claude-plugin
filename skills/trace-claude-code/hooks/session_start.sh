@@ -7,6 +7,7 @@
 ###
 
 set -e
+trap 'exit 0' ERR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
@@ -25,7 +26,8 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 
 WORKSPACE=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
 TRANSCRIPT_PATH=$(find_transcript_path "$SESSION_ID" "$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)" || true)
-PROJECT_ID=$(get_project_id "$PROJECT") || { log "ERROR" "Failed to get project"; exit 0; }
+# Cached lookup only; the background worker resolves the project by name.
+PROJECT_ID=$(get_cached_project_id)
 
 OFFSET=$(get_session_state "$SESSION_ID" "transcript_offset")
 [ -z "$OFFSET" ] && OFFSET=$(count_file_lines "$TRANSCRIPT_PATH")

@@ -4,6 +4,9 @@
 ###
 
 set -e
+# Never surface a failure to Claude Code: a nonzero exit (2 especially) can
+# block the user's prompt. Tracing must be strictly best-effort.
+trap 'exit 0' ERR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
@@ -60,7 +63,7 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
     OUTPUT_FILE=$(printf '%s\n' "$PROMPT" | extract_task_notification_tag "output-file")
     TASK_RESULT=$(printf '%s\n' "$PROMPT" | extract_task_notification_result)
 
-    if [ -n "$TRACE_ID" ] && [ -n "$PROJECT_ID" ] && [ -n "$TASK_SPAN_ID" ] && [ -n "$PARENT_SESSION_ID" ]; then
+    if [ -n "$TRACE_ID" ] && [ -n "$TASK_SPAN_ID" ] && [ -n "$PARENT_SESSION_ID" ]; then
         SPAN_ID=$(generate_span_id)
         NOW=$(get_time_nanos)
         INPUT_JSON=$(jq -cn \
@@ -199,9 +202,10 @@ fi
 TRANSCRIPT_PATH=$(find_transcript_path "$SESSION_ID" "$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)" || true)
 [ -z "$TRANSCRIPT_PATH" ] && TRANSCRIPT_PATH=$(get_session_state "$SESSION_ID" "transcript_path")
 
+# Cached lookup only — hooks never resolve over the network. Empty is fine:
+# spans are queued with the project name and the background worker resolves it.
 PROJECT_ID=$(get_session_state "$SESSION_ID" "project_id")
-[ -z "$PROJECT_ID" ] && PROJECT_ID=$(get_project_id "$PROJECT")
-[ -z "$PROJECT_ID" ] && { log "ERROR" "Failed to get project"; exit 0; }
+[ -z "$PROJECT_ID" ] && PROJECT_ID=$(get_cached_project_id)
 
 OFFSET=$(get_session_state "$SESSION_ID" "transcript_offset")
 [ -z "$OFFSET" ] && OFFSET=$(count_file_lines "$TRANSCRIPT_PATH")

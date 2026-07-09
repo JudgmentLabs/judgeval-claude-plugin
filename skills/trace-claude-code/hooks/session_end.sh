@@ -4,6 +4,7 @@
 ###
 
 set -e
+trap 'exit 0' ERR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
@@ -31,7 +32,7 @@ if [ -z "$TRACE_ID" ]; then
     exit 0
 fi
 
-[ -z "$PROJECT_ID" ] || [ -z "$ROOT_SPAN_ID" ] || [ -z "$TASK_SPAN_ID" ] && { debug "Missing active trace state"; exit 0; }
+[ -z "$ROOT_SPAN_ID" ] || [ -z "$TASK_SPAN_ID" ] && { debug "Missing active trace state"; exit 0; }
 
 TRANSCRIPT_PATH=$(find_transcript_path "$SESSION_ID" "$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)" || true)
 [ -z "$TRANSCRIPT_PATH" ] && TRANSCRIPT_PATH="$STATE_TRANSCRIPT"
@@ -64,5 +65,14 @@ clear_session_keys "$SESSION_ID" \
     active_trace_id active_root_span_id active_task_span_id active_trace_start \
     active_task_start active_prompt active_transcript_offset
 set_state_value "current_trace_id" ""
+
+# The session is over, so waiting here does not affect the user. Give the
+# background worker a bounded window to flush queued spans for durability.
+DRAIN_DEADLINE=$(( $(date +%s) + 90 ))
+while [ "$(ls -A "$QUEUE_DIR/pending" "$QUEUE_DIR/processing" 2>/dev/null | grep -c '.json' || true)" -gt 0 ]; do
+    [ "$(date +%s)" -ge "$DRAIN_DEADLINE" ] && { log "WARN" "Session end: queue not fully drained"; break; }
+    ensure_worker_running
+    sleep 1
+done
 
 exit 0

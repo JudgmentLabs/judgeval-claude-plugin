@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOKS_DIR="$SCRIPT_DIR/hooks"
 
 # Verify hooks exist
-for hook in common.sh turn_trace_common.sh session_start.sh post_tool_use.sh stop_hook.sh session_end.sh user_prompt_submit.sh subagent_stop.sh; do
+for hook in common.sh turn_trace_common.sh worker.sh session_start.sh stop_hook.sh session_end.sh user_prompt_submit.sh subagent_stop.sh; do
     if [ ! -f "$HOOKS_DIR/$hook" ]; then
         echo "❌ Error: Missing hook script: $HOOKS_DIR/$hook"
         exit 1
@@ -138,7 +138,8 @@ HOOKS_CONFIG=$(cat <<EOF
             "hooks": [
                 {
                     "type": "command",
-                    "command": "bash $HOOKS_DIR/session_start.sh"
+                    "command": "bash $HOOKS_DIR/session_start.sh",
+                    "timeout": 10
                 }
             ]
         }
@@ -148,18 +149,8 @@ HOOKS_CONFIG=$(cat <<EOF
             "hooks": [
                 {
                     "type": "command",
-                    "command": "bash $HOOKS_DIR/user_prompt_submit.sh"
-                }
-            ]
-        }
-    ],
-    "PostToolUse": [
-        {
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": "bash $HOOKS_DIR/post_tool_use.sh"
+                    "command": "bash $HOOKS_DIR/user_prompt_submit.sh",
+                    "timeout": 10
                 }
             ]
         }
@@ -169,7 +160,8 @@ HOOKS_CONFIG=$(cat <<EOF
             "hooks": [
                 {
                     "type": "command",
-                    "command": "bash $HOOKS_DIR/stop_hook.sh"
+                    "command": "bash $HOOKS_DIR/stop_hook.sh",
+                    "timeout": 30
                 }
             ]
         }
@@ -190,7 +182,8 @@ HOOKS_CONFIG=$(cat <<EOF
             "hooks": [
                 {
                     "type": "command",
-                    "command": "bash $HOOKS_DIR/subagent_stop.sh"
+                    "command": "bash $HOOKS_DIR/subagent_stop.sh",
+                    "timeout": 30
                 }
             ]
         }
@@ -246,7 +239,6 @@ echo ""
 echo "Hooks configured:"
 echo "  • SessionStart      - Records Claude session metadata"
 echo "  • UserPromptSubmit  - Creates one trace for each user message"
-echo "  • PostToolUse       - Tracks tool activity during the active turn"
 echo "  • Stop              - Creates LLM/tool spans and finalizes the turn trace"
 echo "  • SubagentStop      - Traces subagent (Task tool) execution"
 echo "  • SessionEnd        - Fallback-finalizes any open turn trace"

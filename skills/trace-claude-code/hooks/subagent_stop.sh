@@ -9,6 +9,7 @@
 ###
 
 set -e
+trap 'exit 0' ERR
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
@@ -100,7 +101,6 @@ fi
 
 [ -z "$TRACE_ID" ] && { debug "No current trace or mapped subagent trace"; exit 0; }
 
-[ -z "$PROJECT_ID" ] && { debug "No project ID"; exit 0; }
 [ -z "$ROOT_SPAN_ID" ] && { debug "No root span"; exit 0; }
 
 # Use task span as parent if available, otherwise root

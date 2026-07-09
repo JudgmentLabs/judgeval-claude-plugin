@@ -57,10 +57,16 @@ This will prompt you for:
 |------|---------|--------|
 | `session_start.sh` | Session begins | Records session metadata |
 | `user_prompt_submit.sh` | User sends prompt | Creates a new trace and Task span for the turn |
-| `post_tool_use.sh` | Tool completes | Tracks active tool count |
 | `stop_hook.sh` | Response complete | Parses transcript delta and finalizes the turn trace |
 | `subagent_stop.sh` | Subagent completes | Parses subagent transcript, creates nested spans |
-| `session_end.sh` | Session ends | Fallback-finalizes any open turn trace |
+| `session_end.sh` | Session ends | Fallback-finalizes any open turn trace, then flushes the upload queue |
+
+Hooks never perform network I/O and always exit 0, so they cannot change
+Claude Code's behavior or add meaningful latency. Spans are appended to a
+local queue (`~/.claude/state/judgeval_queue/`) and uploaded by a detached
+background worker (`worker.sh`) with bounded, retried, time-limited requests;
+project-name resolution also happens in the worker. Each hook registers with
+an explicit timeout as a hard backstop.
 
 ## Span Attributes
 
