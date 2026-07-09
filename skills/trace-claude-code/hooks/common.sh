@@ -87,14 +87,25 @@ with_lock() {
 
 # State Management
 load_state() {
-    if [ -f "$STATE_FILE" ]; then
+    # A hook killed mid-write can leave a truncated file; feeding invalid
+    # JSON into the read-modify-write cycle would cascade into a state wipe,
+    # so fall back to a fresh object instead.
+    if [ -f "$STATE_FILE" ] && jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
         cat "$STATE_FILE" 2>/dev/null
     else
+        [ -f "$STATE_FILE" ] && log "WARN" "State file invalid; starting from empty state"
         echo "{}"
     fi
 }
 
 save_state() {
+    # Never persist an empty or invalid state: a failed/killed jq upstream
+    # yields "" from command substitution, and writing it would wipe all
+    # session state (including the cached project routing).
+    if [ -z "$1" ] || ! echo "$1" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        log "ERROR" "Refusing to save empty/invalid state"
+        return 1
+    fi
     local tmp_file="${STATE_FILE}.tmp.$$"
     echo "$1" > "$tmp_file"
     mv -f "$tmp_file" "$STATE_FILE"
