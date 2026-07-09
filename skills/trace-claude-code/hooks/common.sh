@@ -160,12 +160,34 @@ _set_session_state_batch_unsafe() {
 # insert_spans_batch PROJECT_ID span_json... — all spans in ONE OTLP request.
 # The Stop hook can emit 10-20 spans per turn; sequential curls would add
 # seconds of latency before the user's next prompt.
+# Spans per request: bounds payload size (an interrupted 40-llm-span sweep
+# produced a multi-MB payload) while keeping request count low.
+OTLP_CHUNK_SIZE=20
+
 insert_spans_batch() {
     local project_id="$1"; shift
     [ $# -eq 0 ] && return 0
-    local otlp_payload resp http_code
-    [ -n "$DEBUG_ON" ] && debug "Inserting $# span(s)"
-    otlp_payload=$(printf '%s\n' "$@" | jq -cs --arg service_name "$PROJECT" '{
+    local total=$# failed=0
+    [ -n "$DEBUG_ON" ] && debug "Inserting $total span(s)"
+    while [ $# -gt 0 ]; do
+        local chunk=("${@:1:$OTLP_CHUNK_SIZE}")
+        shift $(( $# < OTLP_CHUNK_SIZE ? $# : OTLP_CHUNK_SIZE ))
+        _insert_span_chunk "$project_id" "${chunk[@]}" || failed=$((failed + ${#chunk[@]}))
+    done
+    if [ "$failed" -gt 0 ]; then
+        log "WARN" "OTLP insert: $failed/$total spans failed"
+        return 1
+    fi
+    [ -n "$DEBUG_ON" ] && debug "OTLP insert successful ($total spans)"
+    return 0
+}
+
+_insert_span_chunk() {
+    local project_id="$1"; shift
+    local resp http_code
+    # Payload travels via stdin, never argv: a large batch as a curl
+    # argument fails exec entirely with "Argument list too long".
+    resp=$(printf '%s\n' "$@" | jq -cs --arg service_name "$PROJECT" '{
         resourceSpans: [{
             resource: { attributes: [
                 { key: "service.name", value: { stringValue: $service_name } },
@@ -174,23 +196,21 @@ insert_spans_batch() {
             ]},
             scopeSpans: [{ scope: { name: "judgeval" }, spans: . }]
         }]
-    }')
-    resp=$(curl -s -w "\n%{http_code}" \
-        --max-time 10 \
+    }' | curl -s -w "\n%{http_code}" \
+        --max-time 15 \
         --connect-timeout 3 \
         -X POST \
         -H "Authorization: Bearer $API_KEY" \
         -H "X-Organization-Id: $ORG_ID" \
         -H "X-Project-Id: $project_id" \
         -H "Content-Type: application/json" \
-        -d "$otlp_payload" \
+        --data-binary @- \
         "$API_URL/otel/v1/traces" 2>&1)
     http_code=$(echo "$resp" | tail -1)
     if [[ "$http_code" =~ ^20[012]$ ]]; then
-        [ -n "$DEBUG_ON" ] && debug "OTLP insert successful (HTTP $http_code, $# spans)"
         return 0
     fi
-    log "WARN" "OTLP insert failed (HTTP $http_code, $# spans)"
+    log "WARN" "OTLP chunk insert failed (HTTP $http_code, $# spans)"
     return 1
 }
 
