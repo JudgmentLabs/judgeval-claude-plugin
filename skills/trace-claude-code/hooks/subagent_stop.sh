@@ -30,12 +30,13 @@ PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // 
 BACKGROUND_SUBAGENT_ID=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].id // empty' 2>/dev/null)
 BACKGROUND_DESCRIPTION=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].description // empty' 2>/dev/null)
 
-# Claude Code can emit a control SubagentStop while the real background task is
-# still running. Its transcript path does not exist, and the real task id is in
-# background_tasks, so skip it instead of creating an empty placeholder span.
-if [ -n "$BACKGROUND_SUBAGENT_ID" ] && [ "$BACKGROUND_SUBAGENT_ID" != "$SUBAGENT_ID" ] &&
-   { [ -z "$SUBAGENT_TRANSCRIPT" ] || [ ! -f "$SUBAGENT_TRANSCRIPT" ]; }; then
-    debug "Skipping control SubagentStop for $SUBAGENT_ID; background task $BACKGROUND_SUBAGENT_ID is still running"
+# SubagentStop also fires for events with no transcript on disk: control
+# events while a background task is still running, and Claude Code's internal
+# utility agents (prompt suggestions, summaries, titles — empty agent_type).
+# Real Task delegations always have an agent transcript; without one there is
+# nothing to parse, so skip instead of emitting an empty placeholder span.
+if [ -z "$SUBAGENT_TRANSCRIPT" ] || [ ! -f "$SUBAGENT_TRANSCRIPT" ]; then
+    debug "Skipping SubagentStop for ${SUBAGENT_ID:-unknown}; no subagent transcript to trace (agent_type=$(echo "$INPUT" | jq -r '.agent_type // ""' 2>/dev/null))"
     exit 0
 fi
 
