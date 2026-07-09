@@ -118,6 +118,8 @@ fi
 LLM_CALLS=0
 TOOL_CALLS=0
 SUBAGENT_OUTPUT=""
+SUBAGENT_FIRST_TIME=""
+SUBAGENT_LAST_TIME=""
 
 # Parse transcript for LLM and tool spans
 if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
@@ -197,6 +199,17 @@ if [ -n "$SUBAGENT_TRANSCRIPT" ] && [ -f "$SUBAGENT_TRANSCRIPT" ]; then
         
         MSG_TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
         TIMESTAMP=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
+        if [ -n "$TIMESTAMP" ]; then
+            RECORD_TIME=$(iso_to_nanos "$TIMESTAMP")
+            if [ -n "$RECORD_TIME" ]; then
+                if [ -z "$SUBAGENT_FIRST_TIME" ] || [ "$RECORD_TIME" -lt "$SUBAGENT_FIRST_TIME" ] 2>/dev/null; then
+                    SUBAGENT_FIRST_TIME="$RECORD_TIME"
+                fi
+                if [ -z "$SUBAGENT_LAST_TIME" ] || [ "$RECORD_TIME" -gt "$SUBAGENT_LAST_TIME" ] 2>/dev/null; then
+                    SUBAGENT_LAST_TIME="$RECORD_TIME"
+                fi
+            fi
+        fi
         
         if [ "$MSG_TYPE" = "user" ]; then
             CONTENT=$(echo "$line" | jq -c '.message.content // empty' 2>/dev/null)
@@ -295,6 +308,15 @@ fi
 
 # Create the subagent container span
 END_TIME=$(get_time_nanos)
+if [ -n "$SUBAGENT_FIRST_TIME" ]; then
+    START_TIME="$SUBAGENT_FIRST_TIME"
+fi
+if [ -n "$SUBAGENT_LAST_TIME" ]; then
+    END_TIME="$SUBAGENT_LAST_TIME"
+fi
+if [ "$START_TIME" -gt "$END_TIME" ] 2>/dev/null; then
+    END_TIME="$START_TIME"
+fi
 TASK_INPUT_JSON=$(echo "${TASK_DESCRIPTION:-Subagent task}" | jq -Rs '.')
 SUBAGENT_OUTPUT_JSON=$(echo "${SUBAGENT_OUTPUT:-Completed}" | jq -Rs '.')
 
