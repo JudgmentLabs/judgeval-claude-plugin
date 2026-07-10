@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOKS_DIR="$SCRIPT_DIR/hooks"
 
 # Verify hooks exist
-for hook in common.sh turn_trace_common.sh worker.sh session_start.sh stop_hook.sh session_end.sh user_prompt_submit.sh subagent_stop.sh; do
+for hook in common.sh turn_trace_common.sh worker.sh record_event.sh session_start.sh stop_hook.sh session_end.sh user_prompt_submit.sh subagent_start.sh subagent_stop.sh; do
     if [ ! -f "$HOOKS_DIR/$hook" ]; then
         echo "❌ Error: Missing hook script: $HOOKS_DIR/$hook"
         exit 1
@@ -173,6 +173,18 @@ HOOKS_CONFIG=$(cat <<EOF
                     "type": "command",
                     "command": "bash $HOOKS_DIR/session_end.sh",
                     "timeout": 120
+                }
+            ]
+        }
+    ],
+    "SubagentStart": [
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "bash $HOOKS_DIR/subagent_start.sh",
+                    "timeout": 10
                 }
             ]
         }

@@ -134,6 +134,44 @@ run_turn_start_job() {
     return 0
 }
 
+# --- subagent_start: placeholder container span, visible while it runs ---
+run_subagent_start_job() {
+    local job="$1"
+    local project_id trace_id span_id parent_span_id agent_id agent_type start_time session_id turn_index
+    project_id=$(jf project_id "$job"); trace_id=$(jf trace_id "$job")
+    span_id=$(jf span_id "$job"); parent_span_id=$(jf parent_span_id "$job")
+    agent_id=$(jf agent_id "$job"); agent_type=$(jf agent_type "$job")
+    start_time=$(jf start_time "$job"); session_id=$(jf session_id "$job")
+    turn_index=$(jf turn_index "$job")
+
+    [ -n "$trace_id" ] && [ -n "$span_id" ] && [ -n "$parent_span_id" ] || {
+        log "WARN" "Skipping malformed subagent_start job"; return 0; }
+
+    local input_json attrs span
+    input_json=$(printf '%s' "${agent_type:-Subagent task}" | jq -Rs '.')
+    attrs=$(build_otlp_attributes "$(jq -n \
+        --arg span_kind "task" \
+        --slurpfile input_f <(printf '%s\n' "$input_json") \
+        --arg subagent_id "$agent_id" \
+        --arg agent_type "$agent_type" \
+        --arg session_id "$session_id" \
+        --argjson turn_index "${turn_index:-1}" \
+        '$input_f[0] as $input | {
+            "judgment.span_kind": $span_kind,
+            "judgment.input": $input,
+            "judgment.output": "",
+            "subagent_id": $subagent_id,
+            "agent_type": $agent_type,
+            "judgment.session_id": $session_id,
+            "session_id": $session_id,
+            "turn_index": $turn_index
+        }')"
+    )
+    span=$(build_otlp_span "$trace_id" "$span_id" "$parent_span_id" "Subagent: $agent_id" "task" "$start_time" "$start_time" "$attrs" 0)
+    insert_span "$project_id" "$span" >/dev/null
+    return 0
+}
+
 # --- notification_attach: subagent-result marker + parent span extensions ---
 run_notification_attach_job() {
     local job="$1"
@@ -566,6 +604,11 @@ while true; do
             ;;
         turn_start)
             run_turn_start_job "$work" || true
+            rm -f "$work" 2>/dev/null
+            continue
+            ;;
+        subagent_start)
+            run_subagent_start_job "$work" || true
             rm -f "$work" 2>/dev/null
             continue
             ;;

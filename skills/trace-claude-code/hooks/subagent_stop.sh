@@ -80,8 +80,8 @@ MAPPED_PARENT_USERNAME=""
 MAPPED_PARENT_OS=""
 
 if [ -n "$SUBAGENT_ID" ]; then
-    IFS=$'\037' read -r MAPPED_PARENT_SESSION_ID MAPPED_TRACE_ID MAPPED_PROJECT_ID MAPPED_ROOT_SPAN_ID MAPPED_TASK_SPAN_ID MAPPED_TURN_INDEX MAPPED_DESCRIPTION MAPPED_TRACED MAPPED_TRACE_START MAPPED_TASK_START MAPPED_PARENT_TRACE_END MAPPED_PARENT_TASK_INPUT_JSON MAPPED_PARENT_TASK_OUTPUT_JSON MAPPED_PARENT_LLM_CALLS MAPPED_PARENT_TOOL_CALLS MAPPED_PARENT_WORKSPACE MAPPED_PARENT_WORKSPACE_NAME MAPPED_PARENT_HOSTNAME MAPPED_PARENT_USERNAME MAPPED_PARENT_OS \
-        <<< "$(get_session_fields "subagent:$SUBAGENT_ID" parent_session_id trace_id project_id root_span_id task_span_id turn_index description transcript_traced trace_start task_start parent_trace_end parent_task_input_json parent_task_output_json parent_llm_calls parent_tool_calls parent_workspace parent_workspace_name parent_hostname parent_username parent_os)"
+    IFS=$'\037' read -r MAPPED_PARENT_SESSION_ID MAPPED_TRACE_ID MAPPED_PROJECT_ID MAPPED_ROOT_SPAN_ID MAPPED_TASK_SPAN_ID MAPPED_TURN_INDEX MAPPED_DESCRIPTION MAPPED_TRACED MAPPED_TRACE_START MAPPED_TASK_START MAPPED_PARENT_TRACE_END MAPPED_PARENT_TASK_INPUT_JSON MAPPED_PARENT_TASK_OUTPUT_JSON MAPPED_PARENT_LLM_CALLS MAPPED_PARENT_TOOL_CALLS MAPPED_PARENT_WORKSPACE MAPPED_PARENT_WORKSPACE_NAME MAPPED_PARENT_HOSTNAME MAPPED_PARENT_USERNAME MAPPED_PARENT_OS MAPPED_SUBAGENT_SPAN_ID \
+        <<< "$(get_session_fields "subagent:$SUBAGENT_ID" parent_session_id trace_id project_id root_span_id task_span_id turn_index description transcript_traced trace_start task_start parent_trace_end parent_task_input_json parent_task_output_json parent_llm_calls parent_tool_calls parent_workspace parent_workspace_name parent_hostname parent_username parent_os subagent_span_id)"
 fi
 
 if [ "$MAPPED_TRACED" = "true" ]; then
@@ -203,7 +203,10 @@ extend_parent_turn_spans() {
 }
 
 # Generate subagent container span
-SUBAGENT_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
+# Reuse the container span id created at SubagentStart so the final emit
+# updates the realtime placeholder instead of creating a second container.
+SUBAGENT_SPAN_ID="${MAPPED_SUBAGENT_SPAN_ID:-}"
+[ -z "$SUBAGENT_SPAN_ID" ] && SUBAGENT_SPAN_ID=$(generate_uuid | sed 's/-//g' | head -c 16)
 START_TIME=$(get_time_nanos)
 
 # If no transcript path provided, try to find it
@@ -603,7 +606,7 @@ SUBAGENT_ATTRS=$(build_otlp_attributes "$(jq -n \
         "turn_index": $turn_index
     }')")
 
-SUBAGENT_SPAN=$(build_otlp_span "$TRACE_ID" "$SUBAGENT_SPAN_ID" "$PARENT_SPAN_ID" "Subagent: ${SUBAGENT_ID:-task}" "task" "$START_TIME" "$END_TIME" "$SUBAGENT_ATTRS" 0)
+SUBAGENT_SPAN=$(build_otlp_span "$TRACE_ID" "$SUBAGENT_SPAN_ID" "$PARENT_SPAN_ID" "Subagent: ${SUBAGENT_ID:-task}" "task" "$START_TIME" "$END_TIME" "$SUBAGENT_ATTRS" 20)
 
 if insert_span "$PROJECT_ID" "$SUBAGENT_SPAN"; then
     extend_parent_turn_spans
