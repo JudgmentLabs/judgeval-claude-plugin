@@ -55,6 +55,15 @@ Test locally without marketplace:
 claude --plugin-dir /path/to/judgeval-claude-plugin
 ```
 
+Run the test suite ([bats](https://github.com/bats-core/bats-core)):
+
+```bash
+npm install -g bats   # or: brew install bats-core
+bats --recursive tests
+```
+
+The same suite runs in CI on every pull request.
+
 ## Updating
 
 After plugin updates are released:
