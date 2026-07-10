@@ -1,6 +1,6 @@
 [project]
 name = "judgeval-claude-plugin"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Claude Code plugins for Judgeval - LLM evaluation, logging, and observability"
 authors = [
     { name = "Judgment Labs", email = "support@judgmentlabs.ai" }
@@ -13,6 +13,12 @@ requires-python = ">=3.10"
 Homepage = "https://judgmentlabs.ai"
 Documentation = "https://docs.judgmentlabs.ai"
 Repository = "https://github.com/judgmentlabs/judgeval-claude-plugin"
+
+# Single source of truth: the repo-root VERSION file. Do not hardcode a
+# version here — bump VERSION (see scripts/sync_version.py) instead.
+[tool.hatch.version]
+path = "VERSION"
+pattern = '(?P<version>[0-9]+\.[0-9]+\.[0-9]+)'
 
 [build-system]
 requires = ["hatchling"]

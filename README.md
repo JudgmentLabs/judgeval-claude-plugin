@@ -64,6 +64,19 @@ bats --recursive tests
 
 The same suite runs in CI on every pull request.
 
+### Versioning
+
+The version is single-sourced from the repo-root `VERSION` file. `pyproject.toml`
+reads it dynamically (hatchling); the `.claude-plugin/*.json` manifests are
+generated from it. To bump the version:
+
+```bash
+scripts/sync_version.py 1.1.0   # writes VERSION + regenerates the manifests
+git commit -am "Release 1.1.0" && git tag v1.1.0
+```
+
+CI fails if any manifest drifts from `VERSION`.
+
 ## Updating
 
 After plugin updates are released:

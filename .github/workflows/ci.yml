@@ -43,6 +43,9 @@ jobs:
           done
           echo "All required files present"
 
+      - name: Check version is single-sourced (no drift from VERSION)
+        run: python3 scripts/sync_version.py --check
+
   test:
     name: Test
     runs-on: ubuntu-latest
