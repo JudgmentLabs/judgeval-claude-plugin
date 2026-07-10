@@ -14,7 +14,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-debug "SubagentStop hook triggered"
+# Two entry modes: as the Claude Code hook (no args) it validates the event
+# and enqueues it for the background worker; with --judgeval-process (used by
+# worker.sh) it runs the full processing body on the queued event.
+PROCESS_MODE=0
+[ "${1:-}" = "--judgeval-process" ] && PROCESS_MODE=1
+
+debug "SubagentStop hook triggered (process_mode=$PROCESS_MODE)"
 tracing_enabled || { debug "Tracing disabled"; exit 0; }
 check_requirements || exit 0
 
@@ -24,12 +30,12 @@ debug "SubagentStop input: $(echo "$INPUT" | jq -c '.' 2>/dev/null | head -c 100
 echo "$INPUT" | jq -e '.' >/dev/null 2>&1 || { debug "Invalid JSON"; exit 0; }
 
 # Extract subagent info from hook input
-SUBAGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // .subagent_id // empty' 2>/dev/null)
-SUBAGENT_TRANSCRIPT=$(echo "$INPUT" | jq -r '.agent_transcript_path // empty' 2>/dev/null)
-TASK_DESCRIPTION=$(echo "$INPUT" | jq -r '.task // .description // empty' 2>/dev/null)
-PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // empty' 2>/dev/null)
-BACKGROUND_SUBAGENT_ID=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].id // empty' 2>/dev/null)
-BACKGROUND_DESCRIPTION=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].description // empty' 2>/dev/null)
+SUBAGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // .subagent_id // empty' 2>/dev/null || true)
+SUBAGENT_TRANSCRIPT=$(echo "$INPUT" | jq -r '.agent_transcript_path // empty' 2>/dev/null || true)
+TASK_DESCRIPTION=$(echo "$INPUT" | jq -r '.task // .description // empty' 2>/dev/null || true)
+PARENT_SESSION_ID=$(echo "$INPUT" | jq -r '.parent_session_id // .session_id // empty' 2>/dev/null || true)
+BACKGROUND_SUBAGENT_ID=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].id // empty' 2>/dev/null || true)
+BACKGROUND_DESCRIPTION=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(select(.type == "subagent")) | .[0].description // empty' 2>/dev/null || true)
 
 # SubagentStop also fires for events with no transcript on disk: control
 # events while a background task is still running, and Claude Code's internal
@@ -37,7 +43,16 @@ BACKGROUND_DESCRIPTION=$(echo "$INPUT" | jq -r '(.background_tasks // []) | map(
 # Real Task delegations always have an agent transcript; without one there is
 # nothing to parse, so skip instead of emitting an empty placeholder span.
 if [ -z "$SUBAGENT_TRANSCRIPT" ] || [ ! -f "$SUBAGENT_TRANSCRIPT" ]; then
-    debug "Skipping SubagentStop for ${SUBAGENT_ID:-unknown}; no subagent transcript to trace (agent_type=$(echo "$INPUT" | jq -r '.agent_type // ""' 2>/dev/null))"
+    debug "Skipping SubagentStop for ${SUBAGENT_ID:-unknown}; no subagent transcript to trace (agent_type=$(echo "$INPUT" | jq -r '.agent_type // ""' 2>/dev/null || true))"
+    exit 0
+fi
+
+# Hook mode: defer all parsing and payload building to the background worker.
+if [ "$PROCESS_MODE" -eq 0 ]; then
+    EVENT=$(jq -cn --rawfile input <(printf '%s' "$INPUT") \
+        '{type: "subagent", attempts: 0, input: $input}' 2>/dev/null || true)
+    [ -n "$EVENT" ] && enqueue_payload "$EVENT"
+    debug "Queued subagent processing: ${SUBAGENT_ID:-unknown}"
     exit 0
 fi
 
@@ -99,7 +114,9 @@ if [ -z "$TRACE_ID" ]; then
     TURN_INDEX=$(get_session_state "$PARENT_SESSION_ID" "turn_count")
 fi
 
-[ -z "$TRACE_ID" ] && { debug "No current trace or mapped subagent trace"; exit 0; }
+# Exit 3 signals the worker to retry: a sync subagent's event can precede
+# its turn's finalize job (which writes the mapping) in the queue.
+[ -z "$TRACE_ID" ] && { debug "No current trace or mapped subagent trace"; exit 3; }
 
 [ -z "$ROOT_SPAN_ID" ] && { debug "No root span"; exit 0; }
 
@@ -420,8 +437,8 @@ subagent_tool_output_from_result() {
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         
-        MSG_TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
-        TIMESTAMP=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null)
+        MSG_TYPE=$(echo "$line" | jq -r '.type // empty' 2>/dev/null || true)
+        TIMESTAMP=$(echo "$line" | jq -r '.timestamp // empty' 2>/dev/null || true)
         if [ -n "$TIMESTAMP" ]; then
             RECORD_TIME=$(iso_to_nanos "$TIMESTAMP")
             if [ -n "$RECORD_TIME" ]; then
@@ -435,10 +452,10 @@ subagent_tool_output_from_result() {
         fi
         
         if [ "$MSG_TYPE" = "user" ]; then
-            CONTENT=$(echo "$line" | jq -c '.message.content // empty' 2>/dev/null)
+            CONTENT=$(echo "$line" | jq -c '.message.content // empty' 2>/dev/null || true)
             CONTENT_TYPE=""
             if echo "$CONTENT" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                CONTENT_TYPE=$(echo "$CONTENT" | jq -r '.[0].type // empty' 2>/dev/null)
+                CONTENT_TYPE=$(echo "$CONTENT" | jq -r '.[0].type // empty' 2>/dev/null || true)
             fi
             
             if [ "$CONTENT_TYPE" = "tool_result" ]; then
@@ -453,7 +470,7 @@ subagent_tool_output_from_result() {
                 LLM_START_TIME=$(iso_to_nanos "$TIMESTAMP")
                 
                 # Process tool results
-                TOOL_USE_RESULT=$(echo "$line" | jq -c '.toolUseResult // empty' 2>/dev/null)
+                TOOL_USE_RESULT=$(echo "$line" | jq -c '.toolUseResult // empty' 2>/dev/null || true)
                 
                 while IFS= read -r TOOL_RESULT; do
                     [ -z "$TOOL_RESULT" ] && continue
@@ -476,7 +493,7 @@ subagent_tool_output_from_result() {
                         --arg id "$TOOL_USE_ID" \
                         --rawfile c <(printf '%s' "$TOOL_OUT") \
                         '. += [{role: "tool", timestamp: $ts, tool_use_id: $id, content: [{type: "tool_result", content: $c}], text: $c}]')
-                done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null)
+                done < <(echo "$CONTENT" | jq -c '.[]' 2>/dev/null || true)
                 
                 CURRENT_MODEL=""; CURRENT_PROMPT_TOKENS=0; CURRENT_COMPLETION_TOKENS=0; CURRENT_CACHE_CREATION=0; CURRENT_CACHE_READ=0; CURRENT_REQUEST_ID=""
             else
@@ -497,7 +514,7 @@ subagent_tool_output_from_result() {
             
         elif [ "$MSG_TYPE" = "assistant" ]; then
             LLM_END_TIME=$(iso_to_nanos "$TIMESTAMP")
-            REQUEST_ID=$(echo "$line" | jq -r '.requestId // .request_id // empty' 2>/dev/null)
+            REQUEST_ID=$(echo "$line" | jq -r '.requestId // .request_id // empty' 2>/dev/null || true)
             [ -n "$REQUEST_ID" ] && CURRENT_REQUEST_ID="$REQUEST_ID"
 
             # Track tool_use blocks
@@ -513,20 +530,20 @@ subagent_tool_output_from_result() {
                         CURRENT_TOOL_USES=$(echo "$CURRENT_TOOL_USES" | jq --arg id "$TOOL_ID" --arg name "$TOOL_NAME" --slurpfile input_f <(printf '%s\n' "$TOOL_INPUT") \
                             '$input_f[0] as $input | . += [{type: "tool_use", id: $id, name: $name, input: $input}]')
                     fi
-                done < <(echo "$line" | jq -c '.message.content[] | select(.type == "tool_use")' 2>/dev/null)
+                done < <(echo "$line" | jq -c '.message.content[] | select(.type == "tool_use")' 2>/dev/null || true)
             fi
             
             # Extract text
-            TEXT=$(echo "$line" | jq -r '.message.content | if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null)
+            TEXT=$(echo "$line" | jq -r '.message.content | if type == "array" then [.[] | select(.type == "text") | .text] | join("\n") else . end' 2>/dev/null || true)
             [ -n "$TEXT" ] && CURRENT_OUTPUT="${CURRENT_OUTPUT:+$CURRENT_OUTPUT$'\n'}$TEXT"
             
             # Extract model and usage
-            MODEL=$(echo "$line" | jq -r '.message.model // .model // empty' 2>/dev/null)
+            MODEL=$(echo "$line" | jq -r '.message.model // .model // empty' 2>/dev/null || true)
             [ -n "$MODEL" ] && CURRENT_MODEL="$MODEL"
             
             # Claude Code repeats the same cumulative usage on every assistant content block
             # within a single API call, so use the latest values (replace) instead of accumulating
-            USAGE=$(echo "$line" | jq -c '.message.usage // .usage // {}' 2>/dev/null)
+            USAGE=$(echo "$line" | jq -c '.message.usage // .usage // {}' 2>/dev/null || true)
             if [ -n "$USAGE" ] && [ "$USAGE" != "{}" ]; then
                 INP=$(echo "$USAGE" | jq -r '.input_tokens // 0')
                 [ "$INP" != "null" ] && [ "$INP" -gt 0 ] 2>/dev/null && CURRENT_PROMPT_TOKENS=$INP

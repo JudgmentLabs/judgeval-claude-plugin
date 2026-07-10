@@ -161,16 +161,19 @@ set_session_state_batch() {
 _set_session_state_batch_unsafe() {
     local session_id="$1"
     shift
-    local state key val
+    local state pairs
     state=$(load_state)
+    # Single jq pass for all pairs (previously one full-state pass per key).
+    # Pairs travel over /dev/fd separated by the same control characters
+    # get_session_fields already relies on being absent from values.
+    pairs=""
     while [ $# -ge 2 ]; do
-        key="$1"
-        val="$2"
-        state=$(echo "$state" | jq --arg s "$session_id" --arg k "$key" --rawfile v <(printf '%s' "$val") \
-            '.sessions[$s] = (.sessions[$s] // {}) | .sessions[$s][$k] = $v')
+        pairs+="$1"$'\x1f'"$2"$'\x1e'
         shift 2
     done
-    save_state "$state"
+    save_state "$(echo "$state" | jq --arg s "$session_id" --rawfile pairs <(printf '%s' "$pairs") '
+        ($pairs | split("\u001e") | map(select(length > 0) | (split("\u001f") as $p | {key: $p[0], value: ($p[1:] | join("\u001f"))})) | from_entries) as $updates
+        | .sessions[$s] = ((.sessions[$s] // {}) + $updates)')"
 }
 
 clear_session_keys() {
@@ -277,7 +280,8 @@ insert_span_sync() {
 # is detached from the hook process so hook exit (or kill) never affects it.
 ensure_worker_running() {
     local pid_file="$QUEUE_DIR/worker.pid" pid
-    pid=$(cat "$pid_file" 2>/dev/null)
+    # `|| true`: a missing pid file must not trip set -e / the ERR trap.
+    pid=$(cat "$pid_file" 2>/dev/null || true)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
