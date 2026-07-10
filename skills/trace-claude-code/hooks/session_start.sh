@@ -38,5 +38,8 @@ set_session_state_batch "$SESSION_ID" \
     "transcript_path" "${TRANSCRIPT_PATH:-}" \
     "transcript_offset" "${OFFSET:-0}"
 
+# Adopt queues from crashed or killed sessions (and clean up drained ones).
+sweep_orphan_queues
+
 log "INFO" "Session observed: $SESSION_ID"
 exit 0

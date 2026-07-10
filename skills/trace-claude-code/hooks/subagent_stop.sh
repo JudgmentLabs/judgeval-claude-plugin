@@ -51,7 +51,7 @@ fi
 if [ "$PROCESS_MODE" -eq 0 ]; then
     EVENT=$(jq -cn --rawfile input <(printf '%s' "$INPUT") \
         '{type: "subagent", attempts: 0, input: $input}' 2>/dev/null || true)
-    [ -n "$EVENT" ] && enqueue_payload "$EVENT"
+    [ -n "$EVENT" ] && enqueue_payload "${PARENT_SESSION_ID:-$SESSION_ID}" "$EVENT"
     debug "Queued subagent processing: ${SUBAGENT_ID:-unknown}"
     exit 0
 fi

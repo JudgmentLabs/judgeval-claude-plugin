@@ -29,9 +29,16 @@ source "$SCRIPT_DIR/common.sh"
 # shellcheck source=turn_trace_common.sh
 source "$SCRIPT_DIR/turn_trace_common.sh"
 
-PENDING="$QUEUE_DIR/pending"
-PROCESSING="$QUEUE_DIR/processing"
-PID_FILE="$QUEUE_DIR/worker.pid"
+# One worker per session: this worker only drains its own session's queue,
+# so another session's heavy jobs can never delay this one. Spans produced
+# by jobs here (insert_span) are routed back onto this same queue.
+WORKER_SESSION="${1:-_misc}"
+export QUEUE_SESSION="$WORKER_SESSION"
+
+SESSION_DIR=$(session_queue_dir "$WORKER_SESSION")
+PENDING="$SESSION_DIR/pending"
+PROCESSING="$SESSION_DIR/processing"
+PID_FILE="$SESSION_DIR/worker.pid"
 MAX_ATTEMPTS=5
 IDLE_EXIT_SECS=60
 
@@ -67,7 +74,7 @@ for f in "$PROCESSING"/*.json; do
     mv -f "$f" "$PENDING/$(basename "$f")" 2>/dev/null || true
 done
 
-debug "Queue worker $$ started"
+debug "Queue worker $$ started for session $WORKER_SESSION"
 
 jf() { jq -r --arg k "$1" '.[$k] // empty' "$2" 2>/dev/null; }
 
@@ -578,6 +585,13 @@ run_subagent_job() {
 
 idle_since=$(date +%s)
 while true; do
+    # The pid file doubles as the shutdown signal: if it is gone or owned
+    # by another pid (takeover), exit instead of double-processing.
+    if [ "$(cat "$PID_FILE" 2>/dev/null)" != "$$" ]; then
+        debug "Queue worker $$ lost its lock; exiting"
+        trap - EXIT
+        exit 0
+    fi
     qfile=$(ls -1 "$PENDING" 2>/dev/null | head -1)
     if [ -z "$qfile" ]; then
         if [ $(( $(date +%s) - idle_since )) -ge "$IDLE_EXIT_SECS" ]; then

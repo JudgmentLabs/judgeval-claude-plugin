@@ -60,7 +60,7 @@ JOB=$(jq -cn \
       prompt: $prompt, offset: $offset, end_offset: $end_offset,
       turn_index: $turn_index, workspace: $workspace,
       transcript_path: $transcript_path, last_assistant: "Completed"}' 2>/dev/null || true)
-[ -n "$JOB" ] && enqueue_payload "$JOB"
+[ -n "$JOB" ] && enqueue_payload "$SESSION_ID" "$JOB"
 log "INFO" "Queued session-end finalize: trace=$TRACE_ID session=$SESSION_ID"
 
 set_session_state_batch "$SESSION_ID" \
@@ -73,13 +73,23 @@ clear_session_keys "$SESSION_ID" \
     active_task_start active_prompt active_transcript_offset
 set_state_value "current_trace_id" ""
 
-# The session is over, so waiting here does not affect the user. Give the
-# background worker a bounded window to flush queued spans for durability.
+# The session is over, so waiting here does not affect the user. Give this
+# session's worker a bounded window to flush queued spans for durability.
+SDIR=$(session_queue_dir "$SESSION_ID")
 DRAIN_DEADLINE=$(( $(date +%s) + 90 ))
-while [ "$(ls -A "$QUEUE_DIR/pending" "$QUEUE_DIR/processing" 2>/dev/null | grep -c '.json' || true)" -gt 0 ]; do
+while [ -n "$(ls -A "$SDIR/pending" 2>/dev/null)$(ls -A "$SDIR/processing" 2>/dev/null)" ]; do
     [ "$(date +%s)" -ge "$DRAIN_DEADLINE" ] && { log "WARN" "Session end: queue not fully drained"; break; }
-    ensure_worker_running
+    ensure_worker_running "$SESSION_ID"
     sleep 1
 done
+
+# Fully drained: removing the pid file is the worker's shutdown signal
+# (avoids kill: the pid could have been reused). Then remove the empty
+# subtree; a not-quite-drained queue is left for the SessionStart sweep.
+if [ -z "$(ls -A "$SDIR/pending" 2>/dev/null)$(ls -A "$SDIR/processing" 2>/dev/null)" ]; then
+    rm -f "$SDIR/worker.pid" 2>/dev/null || true
+    sleep 1
+    rmdir "$SDIR/pending" "$SDIR/processing" "$SDIR" 2>/dev/null || true
+fi
 
 exit 0

@@ -236,26 +236,40 @@ _http_insert_span() {
     return 1
 }
 
-# Append a job payload (already-built JSON) to the queue and return
-# immediately. Used for span uploads and recovery finalize jobs.
+# Per-session queue layout (one worker per session, Braintrust-style):
+#   $QUEUE_DIR/<session_id>/pending/<epoch-ns>-<pid>-<rand>.json
+#   $QUEUE_DIR/<session_id>/processing/...
+#   $QUEUE_DIR/<session_id>/worker.pid
+# One session's slow jobs (a huge turn finalize) cannot delay another
+# session's uploads, and within a session FIFO ordering is preserved,
+# which is the only ordering the job pipeline relies on.
+session_queue_dir() {
+    echo "$QUEUE_DIR/$1"
+}
+
+# Append a job payload (already-built JSON) to a session's queue and return
+# immediately. Used for span uploads, turn events, and finalize jobs.
 enqueue_payload() {
-    local payload="$1"
-    local qfile tmp
+    local session_id="$1" payload="$2"
+    local sdir qfile tmp
 
-    mkdir -p "$QUEUE_DIR/pending" "$QUEUE_DIR/processing" 2>/dev/null || return 0
+    [ -z "$session_id" ] && session_id="_misc"
+    sdir=$(session_queue_dir "$session_id")
+    mkdir -p "$sdir/pending" "$sdir/processing" 2>/dev/null || return 0
 
-    qfile="$QUEUE_DIR/pending/$(get_time_nanos)-$$-$RANDOM.json"
+    qfile="$sdir/pending/$(get_time_nanos)-$$-$RANDOM.json"
     tmp="$qfile.tmp"
     printf '%s' "$payload" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
     mv -f "$tmp" "$qfile" 2>/dev/null || { rm -f "$tmp"; return 0; }
 
-    ensure_worker_running
+    ensure_worker_running "$session_id"
     return 0
 }
 
-# Queue a span for background upload and return immediately. Hooks call this
-# instead of doing network I/O so they never block Claude Code. project_id may
-# be empty; the worker resolves $PROJECT by name and caches the id.
+# Queue a span for background upload and return immediately. Runs inside the
+# worker (or its child processes), which exports QUEUE_SESSION so the span
+# lands on the same session's queue as the job that produced it. project_id
+# may be empty; the worker resolves $PROJECT by name and caches the id.
 insert_span() {
     local project_id="$1" span_json="$2"
     local payload
@@ -267,7 +281,7 @@ insert_span() {
         '{type: "span", project_id: $project_id, project_name: $project_name, attempts: 0, span: $span_f[0]}' \
         2>/dev/null) || return 0
     [ -n "$payload" ] || return 0
-    enqueue_payload "$payload"
+    enqueue_payload "${QUEUE_SESSION:-_misc}" "$payload"
     return 0
 }
 
@@ -276,17 +290,57 @@ insert_span_sync() {
     insert_span "$@"
 }
 
-# Spawn the background queue worker if one is not already running. The worker
-# is detached from the hook process so hook exit (or kill) never affects it.
+# Spawn a session's background queue worker if one is not already running.
+# The worker is detached from the hook process so hook exit (or kill) never
+# affects it.
 ensure_worker_running() {
-    local pid_file="$QUEUE_DIR/worker.pid" pid
+    local session_id="$1" pid_file pid
+    [ -z "$session_id" ] && session_id="_misc"
+    pid_file="$(session_queue_dir "$session_id")/worker.pid"
     # `|| true`: a missing pid file must not trip set -e / the ERR trap.
     pid=$(cat "$pid_file" 2>/dev/null || true)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
-    nohup bash "$JUDGEVAL_HOOKS_DIR/worker.sh" </dev/null >/dev/null 2>&1 &
+    nohup bash "$JUDGEVAL_HOOKS_DIR/worker.sh" "$session_id" </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null || true
+    return 0
+}
+
+# Adopt orphaned session queues: sessions that died (or whose worker was
+# killed) with jobs still on disk. Run at SessionStart; spawning is cheap
+# and idempotent. Also migrates any legacy flat-layout queue files.
+sweep_orphan_queues() {
+    local sdir session pid
+    # Legacy flat layout from before per-session queues.
+    if [ -d "$QUEUE_DIR/pending" ]; then
+        mkdir -p "$QUEUE_DIR/_legacy/pending" "$QUEUE_DIR/_legacy/processing" 2>/dev/null || true
+        local f
+        for f in "$QUEUE_DIR/pending"/*.json "$QUEUE_DIR/processing"/*.json; do
+            [ -e "$f" ] || continue
+            mv -f "$f" "$QUEUE_DIR/_legacy/pending/$(basename "$f")" 2>/dev/null || true
+        done
+        rmdir "$QUEUE_DIR/pending" "$QUEUE_DIR/processing" 2>/dev/null || true
+        rm -f "$QUEUE_DIR/worker.pid" 2>/dev/null || true
+    fi
+    for sdir in "$QUEUE_DIR"/*/; do
+        [ -d "$sdir" ] || continue
+        session=$(basename "$sdir")
+        if [ -n "$(ls -A "$sdir/pending" 2>/dev/null)" ] || [ -n "$(ls -A "$sdir/processing" 2>/dev/null)" ]; then
+            pid=$(cat "$sdir/worker.pid" 2>/dev/null || true)
+            if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+                debug "Adopting orphaned queue for session $session"
+                ensure_worker_running "$session"
+            fi
+        else
+            # Fully drained and no live worker: remove the empty subtree.
+            pid=$(cat "$sdir/worker.pid" 2>/dev/null || true)
+            if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+                rm -f "$sdir/worker.pid" 2>/dev/null || true
+                rmdir "$sdir/pending" "$sdir/processing" "$sdir" 2>/dev/null || true
+            fi
+        fi
+    done
     return 0
 }
 

@@ -79,7 +79,7 @@ if [ -n "$SKIP_TRACE_REASON" ]; then
                   workspace: $workspace, workspace_name: $workspace_name,
                   hostname: $hostname, username: $username, os: $os,
                   transcript_path: $transcript_path}' 2>/dev/null || true)
-            [ -n "$EVENT" ] && enqueue_payload "$EVENT"
+            [ -n "$EVENT" ] && enqueue_payload "$parent_session" "$EVENT"
             log "INFO" "Queued task-notification follow-up attach: trace=$trace_id session=$parent_session"
         else
             debug "Missing parent trace state for task-notification follow-up"
@@ -139,7 +139,7 @@ JOB=$(jq -cn \
       prompt: $prompt, offset: $offset, end_offset: $end_offset,
       turn_index: $turn_index, workspace: $workspace,
       transcript_path: $transcript_path, last_assistant: $last_assistant}' 2>/dev/null || true)
-[ -n "$JOB" ] && enqueue_payload "$JOB"
+[ -n "$JOB" ] && enqueue_payload "$SESSION_ID" "$JOB"
 log "INFO" "Queued turn finalize: trace=$TRACE_ID session=$SESSION_ID turn=${TURN_INDEX:-1}"
 
 set_session_state_batch "$SESSION_ID" \

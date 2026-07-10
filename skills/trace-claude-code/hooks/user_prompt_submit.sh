@@ -123,7 +123,7 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
               parent_llm_calls: $parent_llm_calls, parent_tool_calls: $parent_tool_calls,
               workspace: $workspace, workspace_name: $workspace_name,
               hostname: $hostname, username: $username, os: $os}' 2>/dev/null || true)
-        [ -n "$EVENT" ] && enqueue_payload "$EVENT"
+        [ -n "$EVENT" ] && enqueue_payload "$PARENT_SESSION_ID" "$EVENT"
         log "INFO" "Queued subagent task notification attach: task=$TASK_NOTIFICATION_ID trace=$TRACE_ID session=$PARENT_SESSION_ID"
     else
         log "WARN" "Skipping orphan task notification without parent trace mapping: task=$TASK_NOTIFICATION_ID session=$SESSION_ID"
@@ -196,7 +196,7 @@ if [ -n "$DANGLING_TRACE_ID" ] && [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT
               turn_index: $turn_index, workspace: $workspace,
               transcript_path: $transcript_path}' 2>/dev/null || true)
         if [ -n "$JOB" ]; then
-            enqueue_payload "$JOB"
+            enqueue_payload "$SESSION_ID" "$JOB"
             log "INFO" "Queued recovery finalize for unfinalized turn: trace=$DANGLING_TRACE_ID session=$SESSION_ID"
             OFFSET="$D_END"
         fi
@@ -232,7 +232,7 @@ EVENT=$(jq -cn \
       task_span_id: $task_span_id, start_time: $start_time, prompt: $prompt,
       workspace: $workspace, workspace_name: $workspace_name,
       hostname: $hostname, username: $username, os: $os, turn_index: $turn_index}' 2>/dev/null || true)
-[ -n "$EVENT" ] && enqueue_payload "$EVENT"
+[ -n "$EVENT" ] && enqueue_payload "$SESSION_ID" "$EVENT"
 
 set_session_state_batch "$SESSION_ID" \
     "project_id" "$PROJECT_ID" \

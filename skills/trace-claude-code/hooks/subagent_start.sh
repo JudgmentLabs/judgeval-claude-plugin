@@ -77,7 +77,7 @@ EVENT=$(jq -cn \
       trace_id: $trace_id, span_id: $span_id, parent_span_id: $parent_span_id,
       agent_id: $agent_id, agent_type: $agent_type, start_time: $start_time,
       session_id: $session_id, turn_index: $turn_index}' 2>/dev/null || true)
-[ -n "$EVENT" ] && enqueue_payload "$EVENT"
+[ -n "$EVENT" ] && enqueue_payload "$SESSION_ID" "$EVENT"
 
 log "INFO" "Subagent started: $AGENT_ID ($AGENT_TYPE) trace=$TRACE_ID session=$SESSION_ID"
 exit 0

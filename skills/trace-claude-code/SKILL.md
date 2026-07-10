@@ -62,11 +62,14 @@ This will prompt you for:
 | `session_end.sh` | Session ends | Fallback-finalizes any open turn trace, then flushes the upload queue |
 
 Hooks never perform network I/O and always exit 0, so they cannot change
-Claude Code's behavior or add meaningful latency. Spans are appended to a
-local queue (`~/.claude/state/judgeval_queue/`) and uploaded by a detached
-background worker (`worker.sh`) with bounded, retried, time-limited requests;
-project-name resolution also happens in the worker. Each hook registers with
-an explicit timeout as a hard backstop.
+Claude Code's behavior or add meaningful latency. Jobs are appended to a
+per-session local queue (`~/.claude/state/judgeval_queue/<session_id>/`) and
+processed by one detached background worker per session (`worker.sh`) with
+bounded, retried, time-limited requests; payload building and project-name
+resolution also happen in the worker. One session's heavy jobs cannot delay
+another session's uploads; orphaned queues from crashed sessions are adopted
+by a sweep at the next SessionStart. Each hook registers with an explicit
+timeout as a hard backstop.
 
 ## Span Attributes
 
