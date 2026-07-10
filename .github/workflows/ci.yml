@@ -42,3 +42,20 @@ jobs:
             [ -f "$f" ] || { echo "Missing: $f"; exit 1; }
           done
           echo "All required files present"
+
+      - name: Check version is single-sourced (no drift from VERSION)
+        run: python3 scripts/sync_version.py --check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq uuid-runtime bats
+
+      - name: Run bats test suite
+        run: bats --print-output-on-failure --recursive tests

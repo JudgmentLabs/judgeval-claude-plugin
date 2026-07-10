@@ -20,11 +20,13 @@ jobs:
       
       - name: Validate version matches
         run: |
+          # VERSION is the single source of truth; CI guarantees the manifests
+          # match it, so the tag only needs to agree with VERSION.
           tag_version="${{ steps.version.outputs.version }}"
-          plugin_version=$(jq -r '.version' .claude-plugin/marketplace.json)
-          
+          plugin_version=$(cat VERSION)
+
           if [[ "$tag_version" != "$plugin_version" ]]; then
-            echo "Tag version ($tag_version) doesn't match plugin version ($plugin_version)"
+            echo "Tag version ($tag_version) doesn't match VERSION ($plugin_version)"
             exit 1
           fi
       
