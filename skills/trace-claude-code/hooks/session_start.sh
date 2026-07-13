@@ -16,6 +16,10 @@ debug "SessionStart hook triggered"
 tracing_enabled || { debug "Tracing disabled"; exit 0; }
 check_requirements || exit 0
 
+# Self-heal a pre-upgrade bloated state file (detached; no-op when healthy).
+# Done first so it runs even if the rest of this hook is slow on a big file.
+ensure_migration
+
 INPUT=$(cat)
 debug "SessionStart input: $(echo "$INPUT" | head -c 500)"
 

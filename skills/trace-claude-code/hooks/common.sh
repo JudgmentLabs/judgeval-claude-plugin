@@ -355,6 +355,24 @@ ensure_worker_running() {
     return 0
 }
 
+# One-time self-healing for state files that predate the external blob store:
+# older versions stored full conversation envelopes inline, which is exactly
+# what made hooks slow. If the file is large, spawn a detached migration to
+# strip those dead fields (a no-op on current-format entries) so the customer
+# never has to hand-truncate the file. Cheap size gate: a healthy state file
+# is kilobytes, so this only fires on genuinely bloated ones.
+export MIGRATE_THRESHOLD_BYTES="${JUDGEVAL_MIGRATE_THRESHOLD:-2097152}"  # 2 MB
+
+ensure_migration() {
+    local size
+    size=$(wc -c < "$STATE_FILE" 2>/dev/null | tr -d ' ' || true)
+    case "$size" in ''|*[!0-9]*) return 0;; esac
+    [ "$size" -lt "$MIGRATE_THRESHOLD_BYTES" ] && return 0
+    nohup bash "$JUDGEVAL_HOOKS_DIR/migrate_state.sh" </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    return 0
+}
+
 # Project Resolution
 #
 # Hooks may only use the cached id (no network); the background worker
