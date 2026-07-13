@@ -36,8 +36,8 @@ if [ -n "$SKIP_TRACE_REASON" ]; then
     debug "Skipping Stop hook for session $SESSION_ID: $SKIP_TRACE_REASON"
 
     if [ "$SKIP_TRACE_REASON" = "task-notification" ] && [ -n "$LAST_ASSISTANT" ]; then
-        IFS=$'\x1f' read -r parent_session trace_id project_id root_span_id task_span_id trace_start task_start turn_index task_id parent_input_json parent_output_json parent_llm_calls parent_tool_calls parent_workspace parent_workspace_name parent_hostname parent_username parent_os \
-            <<< "$(get_session_fields "$SESSION_ID" parent_session_id parent_trace_id task_notification_project_id task_notification_root_span_id task_notification_task_span_id task_notification_trace_start task_notification_task_start task_notification_turn_index task_notification_task_id task_notification_task_input_json task_notification_task_output_json task_notification_llm_calls task_notification_tool_calls task_notification_workspace task_notification_workspace_name task_notification_hostname task_notification_username task_notification_os)"
+        IFS=$'\x1f' read -r parent_session trace_id project_id root_span_id task_span_id trace_start task_start turn_index task_id parent_blob_ref parent_llm_calls parent_tool_calls parent_workspace parent_workspace_name parent_hostname parent_username parent_os \
+            <<< "$(get_session_fields "$SESSION_ID" parent_session_id parent_trace_id task_notification_project_id task_notification_root_span_id task_notification_task_span_id task_notification_trace_start task_notification_task_start task_notification_turn_index task_notification_task_id task_notification_blob_ref task_notification_llm_calls task_notification_tool_calls task_notification_workspace task_notification_workspace_name task_notification_hostname task_notification_username task_notification_os)"
         notification=$(get_session_state "$SESSION_ID" "task_notification_prompt")
 
         if [ -n "$trace_id" ] && [ -n "$root_span_id" ] && [ -n "$task_span_id" ] && [ -n "$parent_session" ]; then
@@ -56,8 +56,7 @@ if [ -n "$SKIP_TRACE_REASON" ]; then
                 --arg task_id "${task_id:-}" \
                 --rawfile notification <(printf '%s' "${notification:-Task notification}") \
                 --rawfile last_assistant <(printf '%s' "$LAST_ASSISTANT") \
-                --rawfile parent_task_input_json <(printf '%s' "${parent_input_json:-}") \
-                --rawfile parent_task_output_json <(printf '%s' "${parent_output_json:-}") \
+                --arg parent_blob_ref "${parent_blob_ref:-}" \
                 --arg parent_llm_calls "${parent_llm_calls:-0}" \
                 --arg parent_tool_calls "${parent_tool_calls:-0}" \
                 --arg workspace "${parent_workspace:-}" \
@@ -73,8 +72,7 @@ if [ -n "$SKIP_TRACE_REASON" ]; then
                   trace_start: $trace_start, task_start: $task_start,
                   turn_index: $turn_index, task_id: $task_id,
                   notification: $notification, last_assistant: $last_assistant,
-                  parent_task_input_json: $parent_task_input_json,
-                  parent_task_output_json: $parent_task_output_json,
+                  parent_blob_ref: $parent_blob_ref,
                   parent_llm_calls: $parent_llm_calls, parent_tool_calls: $parent_tool_calls,
                   workspace: $workspace, workspace_name: $workspace_name,
                   hostname: $hostname, username: $username, os: $os,
@@ -98,8 +96,8 @@ if [ -n "$SKIP_TRACE_REASON" ]; then
         skip_trace_reason parent_session_id parent_trace_id \
         task_notification_project_id task_notification_root_span_id task_notification_task_span_id \
         task_notification_trace_start task_notification_task_start task_notification_turn_index \
-        task_notification_prompt task_notification_task_id task_notification_task_input_json \
-        task_notification_task_output_json task_notification_llm_calls task_notification_tool_calls \
+        task_notification_prompt task_notification_task_id task_notification_blob_ref \
+        task_notification_llm_calls task_notification_tool_calls \
         task_notification_workspace task_notification_workspace_name task_notification_hostname \
         task_notification_username task_notification_os
     exit 0
@@ -114,7 +112,7 @@ IFS=$'\x1f' read -r TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID TRACE_START TA
 TRANSCRIPT_PATH=$(find_transcript_path "$SESSION_ID" "${TRANSCRIPT_PATH:-$STATE_TRANSCRIPT}" || true)
 [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ] && { debug "No transcript to finalize from"; exit 0; }
 
-END_COUNT=$(count_file_lines "$TRANSCRIPT_PATH")
+END_COUNT=$(count_file_lines_cached "$SESSION_ID" "$TRANSCRIPT_PATH")
 
 JOB=$(jq -cn \
     --arg session_id "$SESSION_ID" \

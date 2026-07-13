@@ -190,8 +190,10 @@ run_notification_attach_job() {
     result=$(jf result "$job"); turn_index=$(jf turn_index "$job")
     extend=$(jf extend_parent "$job"); trace_start=$(jf trace_start "$job")
     task_start=$(jf task_start "$job"); parent_end=$(jf parent_end "$job")
-    parent_input_json=$(jf parent_task_input_json "$job")
-    parent_output_json=$(jf parent_task_output_json "$job")
+    local parent_blob_ref
+    parent_blob_ref=$(jf parent_blob_ref "$job")
+    parent_input_json=$(blob_read "$parent_blob_ref" input)
+    parent_output_json=$(blob_read "$parent_blob_ref" output)
     parent_llm=$(jf parent_llm_calls "$job"); parent_tools=$(jf parent_tool_calls "$job")
     workspace=$(jf workspace "$job"); workspace_name=$(jf workspace_name "$job")
     host=$(jf hostname "$job"); user=$(jf username "$job"); os=$(jf os "$job")
@@ -299,7 +301,7 @@ run_relay_attach_job() {
     local job="$1"
     local session_id parent_session trace_id project_id root_span_id task_span_id
     local trace_start task_start turn_index task_id notification last_assistant
-    local parent_input_json parent_output_json parent_llm parent_tools
+    local parent_input_json parent_output_json parent_llm parent_tools parent_blob_ref
     local workspace workspace_name host user os transcript_path
     session_id=$(jf session_id "$job"); parent_session=$(jf parent_session_id "$job")
     trace_id=$(jf trace_id "$job"); project_id=$(jf project_id "$job")
@@ -307,8 +309,9 @@ run_relay_attach_job() {
     trace_start=$(jf trace_start "$job"); task_start=$(jf task_start "$job")
     turn_index=$(jf turn_index "$job"); task_id=$(jf task_id "$job")
     notification=$(jf notification "$job"); last_assistant=$(jf last_assistant "$job")
-    parent_input_json=$(jf parent_task_input_json "$job")
-    parent_output_json=$(jf parent_task_output_json "$job")
+    parent_blob_ref=$(jf parent_blob_ref "$job")
+    parent_input_json=$(blob_read "$parent_blob_ref" input)
+    parent_output_json=$(blob_read "$parent_blob_ref" output)
     parent_llm=$(jf parent_llm_calls "$job"); parent_tools=$(jf parent_tool_calls "$job")
     workspace=$(jf workspace "$job"); workspace_name=$(jf workspace_name "$job")
     host=$(jf hostname "$job"); user=$(jf username "$job"); os=$(jf os "$job")
@@ -491,9 +494,11 @@ run_relay_attach_job() {
         insert_span "$project_id" "$parent_root_span" >/dev/null
 
         if [ -n "$task_id" ]; then
+            # Persist the updated parent output on the blob (chained subagents
+            # of the same turn read it by ref); keep small fields in state.
+            [ -n "$parent_blob_ref" ] && blob_set_output "$parent_blob_ref" "$updated_output_json"
             set_session_state_batch "subagent:$task_id" \
                 "parent_trace_end" "$parent_end" \
-                "parent_task_output_json" "$updated_output_json" \
                 "parent_llm_calls" "$updated_llm_calls"
         fi
     fi
@@ -535,16 +540,27 @@ run_finalize_job() {
 
     # Refresh the durable parent snapshots that async subagent notifications
     # and follow-ups attach to (previously done inline in the Stop hook).
-    local hostname_v username_v os_v subagent_key
-    hostname_v=$(get_hostname); username_v=$(get_username); os_v=$(get_os)
+    # The large conversation envelopes go to a blob file keyed by trace id
+    # (all this turn's subagents share the same parent snapshot); the mapping
+    # stores only the small ref, keeping every state-file jq pass small.
+    local hostname_v username_v os_v subagent_key subagent_keys
+    subagent_keys=$(load_state | jq -r --arg trace "$TURN_TRACE_ID" '
+        .sessions | to_entries[]
+        | select(.key | startswith("subagent:"))
+        | select(.value.trace_id == $trace) | .key')
+    # Only write the parent blob when this turn actually spawned subagents;
+    # otherwise it would be an orphan no mapping references (and prune misses).
+    if [ -n "$subagent_keys" ]; then
+        hostname_v=$(get_hostname); username_v=$(get_username); os_v=$(get_os)
+        blob_write "$TURN_TRACE_ID" "${TURN_TASK_INPUT_ATTR_JSON:-}" "${TURN_TASK_OUTPUT_ATTR_JSON:-}"
+    fi
     while IFS= read -r subagent_key; do
         [ -z "$subagent_key" ] && continue
         set_session_state_batch "$subagent_key" \
             "trace_start" "${TURN_TRACE_START:-}" \
             "task_start" "${TURN_TASK_START:-}" \
             "parent_trace_end" "${TURN_FINAL_END:-}" \
-            "parent_task_input_json" "${TURN_TASK_INPUT_ATTR_JSON:-}" \
-            "parent_task_output_json" "${TURN_TASK_OUTPUT_ATTR_JSON:-}" \
+            "parent_blob_ref" "$TURN_TRACE_ID" \
             "parent_llm_calls" "${TURN_LLM_CALLS:-0}" \
             "parent_tool_calls" "${TURN_TOOL_CALLS:-0}" \
             "parent_workspace" "${TURN_WORKSPACE:-}" \
@@ -552,13 +568,7 @@ run_finalize_job() {
             "parent_hostname" "$hostname_v" \
             "parent_username" "$username_v" \
             "parent_os" "$os_v"
-    done < <(load_state | jq -r --arg trace "$TURN_TRACE_ID" '
-        .sessions
-        | to_entries[]
-        | select(.key | startswith("subagent:"))
-        | select(.value.trace_id == $trace)
-        | .key
-    ')
+    done <<< "$subagent_keys"
 
     TURN_END_OFFSET=0
     log "INFO" "Trace finalized: $TURN_TRACE_ID (session=$TURN_SESSION_ID, turn=${TURN_INDEX:-1}, llm=$TURN_LLM_CALLS, tools=$TURN_TOOL_CALLS)"

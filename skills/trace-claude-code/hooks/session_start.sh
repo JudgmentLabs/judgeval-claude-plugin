@@ -38,5 +38,10 @@ set_session_state_batch "$SESSION_ID" \
     "transcript_path" "${TRANSCRIPT_PATH:-}" \
     "transcript_offset" "${OFFSET:-0}"
 
+# Sweep blob files left by crashed sessions (normal sessions prune at end).
+# A blob is only live during its turn's subagent attach jobs; anything older
+# than a day is certainly orphaned. Cheap: one find over a small dir.
+[ -d "$BLOB_DIR" ] && find "$BLOB_DIR" -name '*.json' -type f -mtime +1 -delete 2>/dev/null || true
+
 log "INFO" "Session observed: $SESSION_ID"
 exit 0

@@ -189,6 +189,71 @@ _clear_session_keys_unsafe() {
         'reduce $ARGS.positional[] as $k (.; del(.sessions[$s][$k]))' "$@")"
 }
 
+# Remove a session's entry plus every subagent mapping and blob file that
+# belongs to it. Called at SessionEnd so the state file and blob dir never
+# accumulate across sessions (the cause of slow hooks over time).
+prune_session() {
+    with_lock _prune_session_unsafe "$1"
+}
+
+_prune_session_unsafe() {
+    local session_id="$1"
+    local state refs ref
+    state=$(load_state)
+    # Delete blob files referenced by this session's subagent mappings.
+    refs=$(echo "$state" | jq -r --arg s "$session_id" '
+        [ .sessions | to_entries[]
+          | select(.key | startswith("subagent:"))
+          | select(.value.parent_session_id == $s)
+          | .value.parent_blob_ref // empty ] | unique | .[]' 2>/dev/null)
+    for ref in $refs; do
+        blob_delete "$ref"
+    done
+    # Drop the session entry and all subagent mappings that point at it.
+    save_state "$(echo "$state" | jq --arg s "$session_id" '
+        .sessions |= with_entries(
+          select(.key != $s
+                 and ((.value.parent_session_id // "") != $s)))')"
+}
+
+# Blob store: large values (parent conversation envelopes) live in one file
+# per trace, keyed by ref, instead of inline in the shared state JSON. Hooks
+# pass only the small ref; the worker reads the blob by ref when it needs to
+# build a span. Keeps every state-file jq pass small regardless of history.
+export BLOB_DIR="$HOME/.claude/state/judgeval_blobs"
+
+# blob_write <ref> <input_value> <output_value>
+blob_write() {
+    local ref="$1" input="$2" output="$3" tmp
+    mkdir -p "$BLOB_DIR" 2>/dev/null || return 1
+    tmp="$BLOB_DIR/$ref.json.tmp.$$"
+    jq -cn --rawfile input <(printf '%s' "$input") --rawfile output <(printf '%s' "$output") \
+        '{input: $input, output: $output}' > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$BLOB_DIR/$ref.json" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+# blob_read <ref> <field>  (field: input|output)
+blob_read() {
+    local ref="$1" field="$2"
+    [ -n "$ref" ] && [ -f "$BLOB_DIR/$ref.json" ] || return 0
+    jq -r --arg f "$field" '.[$f] // ""' "$BLOB_DIR/$ref.json" 2>/dev/null
+}
+
+# blob_set_output <ref> <output_value>  (relay updates only the output)
+blob_set_output() {
+    local ref="$1" output="$2" tmp cur_input
+    [ -n "$ref" ] || return 1
+    cur_input=$(blob_read "$ref" input)
+    blob_write "$ref" "$cur_input" "$output"
+}
+
+blob_delete() {
+    local ref="$1"
+    [ -n "$ref" ] && rm -f "$BLOB_DIR/$ref.json" 2>/dev/null
+    return 0
+}
+
 # API Operations
 _build_otlp_payload() {
     local span_json="$1"
@@ -444,6 +509,42 @@ count_file_lines() {
     local file="$1"
     [ -n "$file" ] && [ -f "$file" ] || { echo 0; return; }
     awk 'END{print NR}' "$file" 2>/dev/null || echo 0
+}
+
+# Line count that reads only the bytes appended since the last call, instead
+# of re-scanning the whole (append-only, ever-growing) transcript. Caches
+# (byte size, line count) per session in state. Returns the same value as
+# count_file_lines (awk NR) but O(delta): it only fast-paths when the cached
+# byte offset lands exactly on a newline, so the incremental count and a full
+# recount are identical; otherwise (shrank, rotated, mid-line) it recounts.
+count_file_lines_cached() {
+    local session_id="$1" file="$2"
+    [ -n "$file" ] && [ -f "$file" ] || { echo 0; return; }
+    [ -z "$session_id" ] && { count_file_lines "$file"; return; }
+
+    local cur_size prev_size prev_lines boundary delta total
+    cur_size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+    case "$cur_size" in ''|*[!0-9]*) count_file_lines "$file"; return;; esac
+
+    IFS=$'\x1f' read -r prev_size prev_lines \
+        <<< "$(get_session_fields "$session_id" transcript_bytes transcript_lines)"
+
+    total=""
+    if [ -n "$prev_size" ] && [ "$prev_size" -gt 0 ] 2>/dev/null && [ "$cur_size" -ge "$prev_size" ] 2>/dev/null; then
+        # Only trust the fast path if byte prev_size is a newline, i.e. the
+        # cached offset ended on a clean line boundary.
+        boundary=$(tail -c "+${prev_size}" "$file" 2>/dev/null | head -c 1 | od -An -tu1 2>/dev/null | tr -d ' ')
+        if [ "$boundary" = "10" ]; then
+            delta=$(tail -c "+$((prev_size + 1))" "$file" 2>/dev/null | awk 'END{print NR}' 2>/dev/null)
+            total=$(( ${prev_lines:-0} + ${delta:-0} ))
+        fi
+    fi
+    [ -z "$total" ] && total=$(count_file_lines "$file")
+
+    set_session_state_batch "$session_id" \
+        "transcript_bytes" "$cur_size" \
+        "transcript_lines" "$total"
+    echo "$total"
 }
 find_transcript_path() {
     local session_id="$1" provided="${2:-}"

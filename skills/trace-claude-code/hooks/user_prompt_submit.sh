@@ -55,8 +55,8 @@ fi
 
 if [ -n "$TASK_NOTIFICATION_ID" ]; then
     PARENT_KEY="subagent:$TASK_NOTIFICATION_ID"
-    IFS=$'\x1f' read -r PARENT_SESSION_ID TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID TOOL_SPAN_ID TURN_INDEX PARENT_WORKSPACE DESCRIPTION TRACE_START TASK_START PARENT_TRACE_END PARENT_TASK_INPUT_JSON PARENT_TASK_OUTPUT_JSON PARENT_LLM_CALLS PARENT_TOOL_CALLS PARENT_WORKSPACE_NAME PARENT_HOSTNAME PARENT_USERNAME PARENT_OS \
-        <<< "$(get_session_fields "$PARENT_KEY" parent_session_id trace_id project_id root_span_id task_span_id tool_span_id turn_index workspace description trace_start task_start parent_trace_end parent_task_input_json parent_task_output_json parent_llm_calls parent_tool_calls parent_workspace_name parent_hostname parent_username parent_os)"
+    IFS=$'\x1f' read -r PARENT_SESSION_ID TRACE_ID PROJECT_ID ROOT_SPAN_ID TASK_SPAN_ID TOOL_SPAN_ID TURN_INDEX PARENT_WORKSPACE DESCRIPTION TRACE_START TASK_START PARENT_TRACE_END PARENT_BLOB_REF PARENT_LLM_CALLS PARENT_TOOL_CALLS PARENT_WORKSPACE_NAME PARENT_HOSTNAME PARENT_USERNAME PARENT_OS \
+        <<< "$(get_session_fields "$PARENT_KEY" parent_session_id trace_id project_id root_span_id task_span_id tool_span_id turn_index workspace description trace_start task_start parent_trace_end parent_blob_ref parent_llm_calls parent_tool_calls parent_workspace_name parent_hostname parent_username parent_os)"
 
     TASK_STATUS=$(printf '%s\n' "$PROMPT" | extract_task_notification_tag "status")
     TASK_SUMMARY=$(printf '%s\n' "$PROMPT" | extract_task_notification_tag "summary")
@@ -70,10 +70,9 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
         # construction is deferred to the worker via a notification_attach job.
         EXTEND="false"
         PARENT_END="$NOW"
-        if [ -n "$PARENT_TASK_INPUT_JSON" ] && [ -n "$PARENT_TASK_OUTPUT_JSON" ] &&
-           [ -n "$TRACE_START" ] && [ -n "$TASK_START" ] &&
-           echo "$PARENT_TASK_INPUT_JSON" | jq -e 'type == "string"' >/dev/null 2>&1 &&
-           echo "$PARENT_TASK_OUTPUT_JSON" | jq -e 'type == "string"' >/dev/null 2>&1; then
+        _HAS_BLOB="false"
+        [ -n "$PARENT_BLOB_REF" ] && [ -f "$BLOB_DIR/$PARENT_BLOB_REF.json" ] && _HAS_BLOB="true"
+        if [ "$_HAS_BLOB" = "true" ] && [ -n "$TRACE_START" ] && [ -n "$TASK_START" ]; then
             if [ -n "$PARENT_TRACE_END" ] && [ "$PARENT_TRACE_END" -gt "$PARENT_END" ] 2>/dev/null; then
                 PARENT_END="$PARENT_TRACE_END"
             fi
@@ -104,8 +103,7 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
             --arg trace_start "${TRACE_START:-}" \
             --arg task_start "${TASK_START:-}" \
             --arg parent_end "$PARENT_END" \
-            --rawfile parent_task_input_json <(printf '%s' "${PARENT_TASK_INPUT_JSON:-}") \
-            --rawfile parent_task_output_json <(printf '%s' "${PARENT_TASK_OUTPUT_JSON:-}") \
+            --arg parent_blob_ref "${PARENT_BLOB_REF:-}" \
             --arg parent_llm_calls "${PARENT_LLM_CALLS:-0}" \
             --arg parent_tool_calls "${PARENT_TOOL_CALLS:-0}" \
             --arg workspace "${PARENT_WORKSPACE:-}" \
@@ -119,7 +117,7 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
               description: $description, notification: $notification, status: $status, summary: $summary,
               output_file: $output_file, result: $result, turn_index: $turn_index, extend_parent: $extend_parent,
               trace_start: $trace_start, task_start: $task_start, parent_end: $parent_end,
-              parent_task_input_json: $parent_task_input_json, parent_task_output_json: $parent_task_output_json,
+              parent_blob_ref: $parent_blob_ref,
               parent_llm_calls: $parent_llm_calls, parent_tool_calls: $parent_tool_calls,
               workspace: $workspace, workspace_name: $workspace_name,
               hostname: $hostname, username: $username, os: $os}' 2>/dev/null || true)
@@ -141,8 +139,7 @@ if [ -n "$TASK_NOTIFICATION_ID" ]; then
         "task_notification_turn_index" "${TURN_INDEX:-1}" \
         "task_notification_prompt" "$PROMPT" \
         "task_notification_task_id" "$TASK_NOTIFICATION_ID" \
-        "task_notification_task_input_json" "${PARENT_TASK_INPUT_JSON:-}" \
-        "task_notification_task_output_json" "${PARENT_TASK_OUTPUT_JSON:-}" \
+        "task_notification_blob_ref" "${PARENT_BLOB_REF:-}" \
         "task_notification_llm_calls" "${PARENT_LLM_CALLS:-0}" \
         "task_notification_tool_calls" "${PARENT_TOOL_CALLS:-0}" \
         "task_notification_workspace" "${PARENT_WORKSPACE:-}" \
