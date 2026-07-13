@@ -69,8 +69,7 @@ MAPPED_TRACED=""
 MAPPED_TRACE_START=""
 MAPPED_TASK_START=""
 MAPPED_PARENT_TRACE_END=""
-MAPPED_PARENT_TASK_INPUT_JSON=""
-MAPPED_PARENT_TASK_OUTPUT_JSON=""
+MAPPED_PARENT_BLOB_REF=""
 MAPPED_PARENT_LLM_CALLS=""
 MAPPED_PARENT_TOOL_CALLS=""
 MAPPED_PARENT_WORKSPACE=""
@@ -80,8 +79,8 @@ MAPPED_PARENT_USERNAME=""
 MAPPED_PARENT_OS=""
 
 if [ -n "$SUBAGENT_ID" ]; then
-    IFS=$'\037' read -r MAPPED_PARENT_SESSION_ID MAPPED_TRACE_ID MAPPED_PROJECT_ID MAPPED_ROOT_SPAN_ID MAPPED_TASK_SPAN_ID MAPPED_TURN_INDEX MAPPED_DESCRIPTION MAPPED_TRACED MAPPED_TRACE_START MAPPED_TASK_START MAPPED_PARENT_TRACE_END MAPPED_PARENT_TASK_INPUT_JSON MAPPED_PARENT_TASK_OUTPUT_JSON MAPPED_PARENT_LLM_CALLS MAPPED_PARENT_TOOL_CALLS MAPPED_PARENT_WORKSPACE MAPPED_PARENT_WORKSPACE_NAME MAPPED_PARENT_HOSTNAME MAPPED_PARENT_USERNAME MAPPED_PARENT_OS MAPPED_SUBAGENT_SPAN_ID \
-        <<< "$(get_session_fields "subagent:$SUBAGENT_ID" parent_session_id trace_id project_id root_span_id task_span_id turn_index description transcript_traced trace_start task_start parent_trace_end parent_task_input_json parent_task_output_json parent_llm_calls parent_tool_calls parent_workspace parent_workspace_name parent_hostname parent_username parent_os subagent_span_id)"
+    IFS=$'\037' read -r MAPPED_PARENT_SESSION_ID MAPPED_TRACE_ID MAPPED_PROJECT_ID MAPPED_ROOT_SPAN_ID MAPPED_TASK_SPAN_ID MAPPED_TURN_INDEX MAPPED_DESCRIPTION MAPPED_TRACED MAPPED_TRACE_START MAPPED_TASK_START MAPPED_PARENT_TRACE_END MAPPED_PARENT_BLOB_REF MAPPED_PARENT_LLM_CALLS MAPPED_PARENT_TOOL_CALLS MAPPED_PARENT_WORKSPACE MAPPED_PARENT_WORKSPACE_NAME MAPPED_PARENT_HOSTNAME MAPPED_PARENT_USERNAME MAPPED_PARENT_OS MAPPED_SUBAGENT_SPAN_ID \
+        <<< "$(get_session_fields "subagent:$SUBAGENT_ID" parent_session_id trace_id project_id root_span_id task_span_id turn_index description transcript_traced trace_start task_start parent_trace_end parent_blob_ref parent_llm_calls parent_tool_calls parent_workspace parent_workspace_name parent_hostname parent_username parent_os subagent_span_id)"
 fi
 
 if [ "$MAPPED_TRACED" = "true" ]; then
@@ -131,6 +130,9 @@ parent_update_id() {
 }
 
 extend_parent_turn_spans() {
+    local MAPPED_PARENT_TASK_INPUT_JSON MAPPED_PARENT_TASK_OUTPUT_JSON
+    MAPPED_PARENT_TASK_INPUT_JSON=$(blob_read "$MAPPED_PARENT_BLOB_REF" input)
+    MAPPED_PARENT_TASK_OUTPUT_JSON=$(blob_read "$MAPPED_PARENT_BLOB_REF" output)
     [ -n "$MAPPED_PARENT_TASK_INPUT_JSON" ] && [ -n "$MAPPED_PARENT_TASK_OUTPUT_JSON" ] || { debug "No stored parent attrs for late subagent parent update"; return; }
     [ -n "$MAPPED_TRACE_START" ] && [ -n "$MAPPED_TASK_START" ] || { debug "No stored parent start time for late subagent parent update"; return; }
     echo "$MAPPED_PARENT_TASK_INPUT_JSON" | jq -e 'type == "string"' >/dev/null 2>&1 || { debug "Invalid stored parent input attrs"; return; }
